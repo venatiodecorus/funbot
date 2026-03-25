@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  controller:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    environment:
+      FUNBOT_ROLE: controller
+      FUNBOT_REDIS_ADDRESS: redis:6379
+    volumes:
+      - ../../config:/etc/funbot:ro
+      - art-data:/data/asciiart
+    depends_on:
+      - redis
+
+  # Example worker for a test network. Duplicate and rename for each network.
+  # worker-testnet:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/docker/Dockerfile
+  #   environment:
+  #     FUNBOT_ROLE: worker
+  #     FUNBOT_NETWORK: testnet
+  #     FUNBOT_REDIS_ADDRESS: redis:6379
+  #   volumes:
+  #     - ../../config:/etc/funbot:ro
+  #     - art-data:/data/asciiart
+  #   depends_on:
+  #     - redis
+  #     - controller
+
+volumes:
+  redis-data:
+  art-data:

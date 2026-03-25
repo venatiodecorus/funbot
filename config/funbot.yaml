@@ -1,0 +1,36 @@
+role: controller
+
+controller:
+  home_network: "homenet"
+  command_prefix: "!"
+  auth:
+    nick: "myname"
+    hostname: "my.host.mask"
+
+redis:
+  address: "redis:6379"
+  password: ""
+  db: 0
+
+networks:
+  homenet:
+    servers:
+      - "irc.home.net:6697"
+    ssl: true
+    nick_prefix: "funbot"
+    max_clients_per_ip: 3
+    channels:
+      - "#control"
+    flood_delay_ms: 500
+
+proxies:
+  file: ""
+
+art:
+  repo_url: "https://github.com/birdneststream/asciiart.git"
+  local_path: "/data/asciiart"
+  update_interval: "1h"
+
+logging:
+  level: "info"
+  format: "json"
