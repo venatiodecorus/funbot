@@ -7,11 +7,24 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
+	"time"
 
 	"github.com/lrstanley/girc"
 	"golang.org/x/net/proxy"
 )
+
+// Reconnection defaults.
+const (
+	DefaultReconnectBaseDelay = 2 * time.Second
+	DefaultReconnectMaxDelay  = 5 * time.Minute
+	DefaultReconnectMaxRetry  = 0 // 0 means retry forever
+)
+
+// DisconnectHandler is called when the client disconnects from IRC.
+// The error parameter is nil if the disconnect was intentional.
+type DisconnectHandler func(err error)
 
 // MessageHandler is called when the client receives a PRIVMSG.
 // Parameters: nick, hostname, target, message.
@@ -25,6 +38,8 @@ type Client struct {
 	id      string
 	network string
 	gircCli *girc.Client
+	cfg     ClientConfig // saved for reconnection
+	flood   *FloodControl
 	log     *slog.Logger
 
 	mu        sync.RWMutex
@@ -35,24 +50,26 @@ type Client struct {
 	proxyUser string // SOCKS5 proxy username
 	proxyPass string // SOCKS5 proxy password
 
-	onPrivmsg MessageHandler
-	onConnect ConnectHandler
+	onPrivmsg    MessageHandler
+	onConnect    ConnectHandler
+	onDisconnect DisconnectHandler
 }
 
 // ClientConfig holds the configuration for creating a new IRC client.
 type ClientConfig struct {
-	ID        string
-	Network   string
-	Server    string
-	Port      int
-	SSL       bool
-	Nick      string
-	User      string
-	Realname  string
-	Logger    *slog.Logger
-	ProxyAddr string // SOCKS5 proxy address (host:port), empty for direct
-	ProxyUser string // SOCKS5 proxy username (optional)
-	ProxyPass string // SOCKS5 proxy password (optional)
+	ID         string
+	Network    string
+	Server     string
+	Port       int
+	SSL        bool
+	Nick       string
+	User       string
+	Realname   string
+	Logger     *slog.Logger
+	FloodDelay time.Duration // Minimum delay between messages (0 = no limit)
+	ProxyAddr  string        // SOCKS5 proxy address (host:port), empty for direct
+	ProxyUser  string        // SOCKS5 proxy username (optional)
+	ProxyPass  string        // SOCKS5 proxy password (optional)
 }
 
 // New creates a new IRC client with the given configuration.
@@ -80,10 +97,17 @@ func New(cfg ClientConfig) *Client {
 	}
 	log = log.With("client_id", cfg.ID, "network", cfg.Network)
 
+	var flood *FloodControl
+	if cfg.FloodDelay > 0 {
+		flood = NewFloodControl(cfg.FloodDelay)
+	}
+
 	c := &Client{
 		id:        cfg.ID,
 		network:   cfg.Network,
 		gircCli:   gircCli,
+		cfg:       cfg,
+		flood:     flood,
 		log:       log,
 		nick:      cfg.Nick,
 		proxyAddr: cfg.ProxyAddr,
@@ -109,6 +133,10 @@ func New(cfg ClientConfig) *Client {
 		c.connected = false
 		c.mu.Unlock()
 		c.log.Info("disconnected from IRC")
+
+		if c.onDisconnect != nil {
+			c.onDisconnect(nil)
+		}
 	})
 
 	gircCli.Handlers.AddBg(girc.PRIVMSG, func(gc *girc.Client, e girc.Event) {
@@ -155,7 +183,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		c.gircCli.Close()
+		c.Quit("shutting down")
 		return ctx.Err()
 	case err := <-errCh:
 		if err != nil {
@@ -163,6 +191,128 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 		return nil
 	}
+}
+
+// ConnectWithRetry connects to IRC with automatic reconnection on disconnect.
+// It uses exponential backoff between retry attempts. It blocks until the
+// context is cancelled or maxRetries is exceeded (0 = retry forever).
+func (c *Client) ConnectWithRetry(ctx context.Context, maxRetries int) error {
+	baseDelay := DefaultReconnectBaseDelay
+	maxDelay := DefaultReconnectMaxDelay
+	attempt := 0
+
+	for {
+		err := c.Connect(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		attempt++
+		if err != nil {
+			c.log.Warn("connection failed",
+				"attempt", attempt,
+				"error", err,
+			)
+		} else {
+			// Connection was established but then dropped
+			c.log.Warn("connection lost, will reconnect",
+				"attempt", attempt,
+			)
+		}
+
+		if maxRetries > 0 && attempt >= maxRetries {
+			return fmt.Errorf("max reconnection attempts (%d) reached: %w", maxRetries, err)
+		}
+
+		// Exponential backoff with jitter cap
+		delay := time.Duration(float64(baseDelay) * math.Pow(1.5, float64(attempt-1)))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		c.log.Info("reconnecting",
+			"delay", delay,
+			"attempt", attempt,
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// Reset the girc client for a fresh connection
+			c.resetGircClient()
+		}
+	}
+}
+
+// resetGircClient creates a fresh girc client for reconnection, preserving
+// all existing handlers and configuration.
+func (c *Client) resetGircClient() {
+	c.log.Debug("resetting IRC client for reconnection")
+	gircConfig := girc.Config{
+		Server: c.cfg.Server,
+		Port:   c.cfg.Port,
+		Nick:   c.cfg.Nick,
+		User:   c.cfg.User,
+		Name:   c.cfg.Realname,
+		SSL:    c.cfg.SSL,
+	}
+
+	if c.cfg.SSL {
+		gircConfig.TLSConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	gircCli := girc.New(gircConfig)
+
+	// Re-register core handlers
+	gircCli.Handlers.AddBg(girc.CONNECTED, func(gc *girc.Client, e girc.Event) {
+		c.mu.Lock()
+		c.connected = true
+		c.nick = gc.GetNick()
+		c.mu.Unlock()
+		c.log.Info("connected to IRC", "nick", gc.GetNick())
+
+		if c.onConnect != nil {
+			c.onConnect()
+		}
+	})
+
+	gircCli.Handlers.AddBg(girc.DISCONNECTED, func(gc *girc.Client, e girc.Event) {
+		c.mu.Lock()
+		c.connected = false
+		c.mu.Unlock()
+		c.log.Info("disconnected from IRC")
+
+		if c.onDisconnect != nil {
+			c.onDisconnect(nil)
+		}
+	})
+
+	gircCli.Handlers.AddBg(girc.PRIVMSG, func(gc *girc.Client, e girc.Event) {
+		if c.onPrivmsg != nil {
+			hostname := ""
+			if e.Source != nil {
+				hostname = e.Source.Host
+			}
+			c.onPrivmsg(e.Source.Name, hostname, e.Params[0], e.Last())
+		}
+	})
+
+	gircCli.Handlers.AddBg(girc.NICK, func(gc *girc.Client, e girc.Event) {
+		if e.Source.Name == c.Nick() || e.Last() == gc.GetNick() {
+			c.mu.Lock()
+			c.nick = gc.GetNick()
+			c.mu.Unlock()
+			c.log.Info("nick changed", "new_nick", gc.GetNick())
+		}
+	})
+
+	c.mu.Lock()
+	c.gircCli = gircCli
+	c.connected = false
+	c.mu.Unlock()
 }
 
 // createProxyDialer creates a SOCKS5 proxy dialer from the client config.
@@ -187,8 +337,23 @@ func (c *Client) ProxyAddr() string {
 	return c.proxyAddr
 }
 
-// Close cleanly disconnects from IRC.
+// Quit sends an IRC QUIT command with the given reason, then closes the
+// connection. This is the preferred way to disconnect during graceful
+// shutdown, as it notifies the IRC server and other users.
+func (c *Client) Quit(reason string) {
+	if c.IsConnected() {
+		c.log.Info("sending QUIT", "reason", reason)
+		c.gircCli.Cmd.SendRaw("QUIT :" + reason)
+		// Give the server a moment to process the QUIT before closing
+		time.Sleep(500 * time.Millisecond)
+	}
+	c.gircCli.Close()
+}
+
+// Close disconnects from IRC. For graceful shutdown, prefer Quit() which
+// sends a QUIT message first.
 func (c *Client) Close() {
+	c.log.Debug("closing IRC connection")
 	c.gircCli.Close()
 }
 
@@ -254,13 +419,36 @@ func (c *Client) Part(channel string) {
 }
 
 // Privmsg sends a PRIVMSG to a target (channel or user).
+// If flood control is enabled, it waits until it's safe to send.
 func (c *Client) Privmsg(target, message string) {
+	if c.flood != nil {
+		c.flood.Wait()
+	}
+	c.gircCli.Cmd.Message(target, message)
+}
+
+// PrivmsgNoFlood sends a PRIVMSG without applying flood control.
+// This is used by the art player which manages its own timing.
+func (c *Client) PrivmsgNoFlood(target, message string) {
 	c.gircCli.Cmd.Message(target, message)
 }
 
 // SendRaw sends a raw IRC command.
+// If flood control is enabled, it waits until it's safe to send.
 func (c *Client) SendRaw(raw string) {
+	if c.flood != nil {
+		c.flood.Wait()
+	}
+	c.log.Debug("sending raw command", "raw", raw)
 	c.gircCli.Cmd.SendRaw(raw)
+}
+
+// FloodDelay returns the configured flood delay, or 0 if not set.
+func (c *Client) FloodDelay() time.Duration {
+	if c.flood != nil {
+		return c.flood.Delay()
+	}
+	return 0
 }
 
 // OnPrivmsg sets the handler for incoming PRIVMSG events.
@@ -271,6 +459,11 @@ func (c *Client) OnPrivmsg(handler MessageHandler) {
 // OnConnect sets the handler for successful IRC connection.
 func (c *Client) OnConnect(handler ConnectHandler) {
 	c.onConnect = handler
+}
+
+// OnDisconnect sets the handler for IRC disconnection events.
+func (c *Client) OnDisconnect(handler DisconnectHandler) {
+	c.onDisconnect = handler
 }
 
 // GircClient returns the underlying girc client. This should only be

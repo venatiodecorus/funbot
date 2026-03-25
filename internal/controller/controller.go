@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/venatiodecorus/funbot/internal/art"
 	"github.com/venatiodecorus/funbot/internal/auth"
 	"github.com/venatiodecorus/funbot/internal/config"
+	"github.com/venatiodecorus/funbot/internal/health"
 	"github.com/venatiodecorus/funbot/internal/irc"
 	fnredis "github.com/venatiodecorus/funbot/internal/redis"
 )
@@ -25,8 +27,10 @@ type Controller struct {
 	cmdCtx     *CommandContext
 	dispatcher *CommandDispatcher
 	redis      *fnredis.Client
+	scaler     *Scaler
+	artRepo    *art.Repo
+	artCatalog *art.Catalog
 	log        *slog.Logger
-	cmdCounter atomic.Uint64
 }
 
 // New creates a new Controller from the given configuration.
@@ -69,6 +73,21 @@ func New(cfg *config.Config, redisClient *fnredis.Client, log *slog.Logger) (*Co
 
 	dispatcher := NewCommandDispatcher(prefix, cmdCtx, log)
 
+	// Set up art repo and catalog
+	var artRepo *art.Repo
+	var artCatalog *art.Catalog
+	if cfg.Art.RepoURL != "" && cfg.Art.LocalPath != "" {
+		interval, err := time.ParseDuration(cfg.Art.UpdateInterval)
+		if err != nil {
+			interval = 1 * time.Hour
+		}
+		artRepo = art.NewRepo(cfg.Art.RepoURL, cfg.Art.LocalPath, interval, log)
+		artCatalog = art.NewCatalog(cfg.Art.LocalPath, log)
+	}
+
+	// Initialize Kubernetes scaler (nil when not in cluster)
+	scaler := NewScaler(log)
+
 	ctrl := &Controller{
 		cfg:        cfg,
 		ircClient:  ircClient,
@@ -76,6 +95,9 @@ func New(cfg *config.Config, redisClient *fnredis.Client, log *slog.Logger) (*Co
 		cmdCtx:     cmdCtx,
 		dispatcher: dispatcher,
 		redis:      redisClient,
+		scaler:     scaler,
+		artRepo:    artRepo,
+		artCatalog: artCatalog,
 		log:        log,
 	}
 
@@ -96,45 +118,102 @@ func New(cfg *config.Config, redisClient *fnredis.Client, log *slog.Logger) (*Co
 	return ctrl, nil
 }
 
-// Run starts the controller. It blocks until the context is cancelled
-// or the IRC connection is lost.
+// Run starts the controller. It blocks until the context is cancelled.
+// The IRC connection automatically reconnects on disconnection.
 func (c *Controller) Run(ctx context.Context) error {
 	c.log.Info("starting controller",
 		"home_network", c.cfg.Controller.HomeNetwork,
 		"auth_nick", c.cfg.Controller.Auth.Nick,
 	)
 
+	// Initialize art repo if configured
+	if c.artRepo != nil {
+		if err := c.artRepo.Init(ctx); err != nil {
+			c.log.Warn("failed to initialize art repo", "error", err)
+		} else {
+			if err := c.artCatalog.Refresh(); err != nil {
+				c.log.Warn("failed to refresh art catalog", "error", err)
+			}
+			go c.artRepo.StartUpdater(ctx)
+		}
+	}
+
 	// Start listening for acks from workers
 	if c.redis != nil {
 		go c.listenAcks(ctx)
 	}
 
-	return c.ircClient.Connect(ctx)
+	// Start health check server
+	healthSrv := health.New("", c.IsReady, c.log)
+	healthSrv.Start()
+	defer healthSrv.Shutdown()
+
+	// Connect with automatic reconnection — controller should always stay connected
+	return c.ircClient.ConnectWithRetry(ctx, 0)
+}
+
+// IsReady returns true when the controller is connected to IRC.
+func (c *Controller) IsReady() bool {
+	return c.ircClient.IsConnected()
 }
 
 // listenAcks subscribes to the ack channel and logs results.
-// In the future this could be used to relay results back to the user.
+// It automatically resubscribes if the connection is lost.
+// Ack messages are also relayed back to the authorized user via IRC PM.
 func (c *Controller) listenAcks(ctx context.Context) {
-	ackCh, err := c.redis.SubscribeAcks(ctx)
-	if err != nil {
-		c.log.Error("failed to subscribe to acks", "error", err)
-		return
-	}
+	const resubscribeDelay = 3 * time.Second
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case ack, ok := <-ackCh:
-			if !ok {
+		}
+
+		ackCh, err := c.redis.SubscribeAcks(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
 				return
 			}
-			c.log.Info("received ack",
-				"command_id", ack.CommandID,
-				"pod", ack.Pod,
-				"success", ack.Success,
-				"message", ack.Message,
-			)
+			c.log.Error("failed to subscribe to acks, retrying", "error", err, "delay", resubscribeDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(resubscribeDelay):
+				continue
+			}
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ack, ok := <-ackCh:
+				if !ok {
+					c.log.Warn("ack channel closed, resubscribing")
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(resubscribeDelay):
+					}
+					break // resubscribe
+				}
+				c.log.Info("received ack",
+					"command_id", ack.CommandID,
+					"pod", ack.Pod,
+					"success", ack.Success,
+					"message", ack.Message,
+				)
+				// Relay ack result to authorized user
+				if c.ircClient.IsConnected() {
+					status := "OK"
+					if !ack.Success {
+						status = "FAIL"
+					}
+					msg := fmt.Sprintf("[%s] %s@%s: %s", status, ack.CommandID, ack.Pod, ack.Message)
+					c.ircClient.Privmsg(c.cfg.Controller.Auth.Nick, msg)
+				}
+				continue
+			}
+			break
 		}
 	}
 }
@@ -171,15 +250,18 @@ func (c *Controller) generateCommandID() string {
 // publishCommand sends a command to workers via Redis.
 func (c *Controller) publishCommand(cmd fnredis.Command) string {
 	if c.redis == nil {
+		c.log.Warn("attempted to publish command without Redis connection", "type", cmd.Type, "network", cmd.Network)
 		return "Redis not connected — cannot route to workers"
 	}
 
 	cmd.ID = c.generateCommandID()
 
 	if err := c.redis.PublishCommand(context.Background(), cmd); err != nil {
+		c.log.Error("failed to publish command", "type", cmd.Type, "id", cmd.ID, "network", cmd.Network, "error", err)
 		return fmt.Sprintf("Error sending command: %v", err)
 	}
 
+	c.log.Info("command published", "type", cmd.Type, "id", cmd.ID, "network", cmd.Network)
 	return fmt.Sprintf("Command sent [%s] to %s workers", cmd.ID, cmd.Network)
 }
 
@@ -194,6 +276,12 @@ func (c *Controller) registerCommands() {
 	c.dispatcher.Register("pm", c.handlePM)
 	c.dispatcher.Register("say", c.handleSay)
 	c.dispatcher.Register("raw", c.handleRaw)
+	c.dispatcher.Register("art", c.handleArt)
+	c.dispatcher.Register("artlist", c.handleArtList)
+	c.dispatcher.Register("artsearch", c.handleArtSearch)
+	c.dispatcher.Register("scale", c.handleScale)
+	c.dispatcher.Register("connect", c.handleConnect)
+	c.dispatcher.Register("disconnect", c.handleDisconnect)
 }
 
 // handleStatus implements !status [network].
@@ -524,6 +612,277 @@ func (c *Controller) handleKeepNick(args []string) string {
 		Network: network,
 		Args:    cmdArgs,
 	})
+}
+
+// handleArt implements !art [network] [#channel] [count] <artname>.
+func (c *Controller) handleArt(args []string) string {
+	if len(args) == 0 {
+		return "Usage: !art [network] [#channel] [count] <artname>"
+	}
+
+	var network, channel, artName string
+	var count int
+
+	// Parse args: the last non-numeric, non-channel, non-network arg is the art name.
+	// We parse in order: network, channel, count can appear in any order before artname.
+	remaining := make([]string, 0, len(args))
+	for _, arg := range args {
+		if IsChannel(arg) {
+			channel = arg
+		} else if n, err := strconv.Atoi(arg); err == nil {
+			count = n
+		} else if network == "" {
+			if _, exists := c.cfg.Networks[arg]; exists {
+				network = arg
+				continue
+			}
+			remaining = append(remaining, arg)
+		} else {
+			remaining = append(remaining, arg)
+		}
+	}
+
+	if len(remaining) == 0 {
+		return "No art name specified"
+	}
+	artName = remaining[len(remaining)-1]
+
+	network = c.cmdCtx.ResolveNetwork(network)
+	channel = c.cmdCtx.ResolveChannel(channel)
+
+	if network == "" {
+		return "No network specified and no context set"
+	}
+	if channel == "" {
+		return "No channel specified and no context set"
+	}
+
+	// Verify art exists before sending to workers
+	if c.artCatalog != nil {
+		entries := c.artCatalog.FindByName(artName)
+		if len(entries) == 0 {
+			return fmt.Sprintf("Art %q not found. Use !artsearch to search.", artName)
+		}
+	}
+
+	return c.publishCommand(fnredis.Command{
+		Type:    "art",
+		Network: network,
+		Channel: channel,
+		Count:   count,
+		Args:    []string{artName},
+	})
+}
+
+// handleArtList implements !artlist [category].
+func (c *Controller) handleArtList(args []string) string {
+	if c.artCatalog == nil {
+		return "Art catalog not initialized"
+	}
+
+	if len(args) == 0 {
+		// List categories
+		cats := c.artCatalog.ListCategories()
+		if len(cats) == 0 {
+			return fmt.Sprintf("No art files found (%d total indexed)", c.artCatalog.Count())
+		}
+
+		var lines []string
+		lines = append(lines, fmt.Sprintf("Art categories (%d files total):", c.artCatalog.Count()))
+		for _, cat := range cats {
+			entries := c.artCatalog.ListByCategory(cat)
+			lines = append(lines, fmt.Sprintf("  %s (%d files)", cat, len(entries)))
+		}
+
+		// Limit output to avoid flooding
+		if len(lines) > 30 {
+			lines = lines[:30]
+			lines = append(lines, "  ... (truncated, use !artlist <category> to browse)")
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	// List files in a category
+	category := args[0]
+	entries := c.artCatalog.ListByCategory(category)
+	if len(entries) == 0 {
+		return fmt.Sprintf("No art files found in category %q", category)
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Art in %q (%d files):", category, len(entries)))
+	for _, e := range entries {
+		lines = append(lines, fmt.Sprintf("  %s", e.Name))
+	}
+
+	if len(lines) > 30 {
+		lines = lines[:30]
+		lines = append(lines, "  ... (truncated)")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// handleArtSearch implements !artsearch <query>.
+func (c *Controller) handleArtSearch(args []string) string {
+	if c.artCatalog == nil {
+		return "Art catalog not initialized"
+	}
+
+	if len(args) == 0 {
+		return "Usage: !artsearch <query>"
+	}
+
+	query := strings.Join(args, " ")
+	results := c.artCatalog.Search(query)
+
+	if len(results) == 0 {
+		return fmt.Sprintf("No art files matching %q", query)
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Search results for %q (%d matches):", query, len(results)))
+	for _, e := range results {
+		if e.Category != "" {
+			lines = append(lines, fmt.Sprintf("  %s/%s", e.Category, e.Name))
+		} else {
+			lines = append(lines, fmt.Sprintf("  %s", e.Name))
+		}
+	}
+
+	if len(lines) > 20 {
+		lines = lines[:20]
+		lines = append(lines, "  ... (truncated, refine your search)")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// handleScale implements !scale <network> <replicas>.
+func (c *Controller) handleScale(args []string) string {
+	if c.scaler == nil {
+		return "Scaling not available (not running in Kubernetes)"
+	}
+
+	if len(args) < 2 {
+		return "Usage: !scale <network> <replicas>"
+	}
+
+	network := args[0]
+	replicas, err := strconv.Atoi(args[1])
+	if err != nil || replicas < 0 {
+		return fmt.Sprintf("Invalid replica count: %s", args[1])
+	}
+
+	ctx := context.Background()
+
+	exists, err := c.scaler.DeploymentExists(ctx, network)
+	if err != nil || !exists {
+		return fmt.Sprintf("No worker deployment found for network %q", network)
+	}
+
+	currentReplicas, err := c.scaler.GetReplicas(ctx, network)
+	if err != nil {
+		return fmt.Sprintf("Error getting current replicas: %v", err)
+	}
+
+	if err := c.scaler.Scale(ctx, network, int32(replicas)); err != nil {
+		return fmt.Sprintf("Error scaling: %v", err)
+	}
+
+	return fmt.Sprintf("Scaled %s from %d to %d replicas", network, currentReplicas, replicas)
+}
+
+// handleConnect implements !connect <network> <server:port> [ssl].
+// Creates a new worker Deployment for the network.
+func (c *Controller) handleConnect(args []string) string {
+	if len(args) < 2 {
+		return "Usage: !connect <network> <server:port> [ssl]"
+	}
+
+	network := args[0]
+	serverAddr := args[1]
+	ssl := false
+	if len(args) >= 3 && args[2] == "ssl" {
+		ssl = true
+	}
+
+	// Check if network already exists in config
+	if _, exists := c.cfg.Networks[network]; exists {
+		return fmt.Sprintf("Network %q already exists in config", network)
+	}
+
+	// Add network to runtime config
+	server, port, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return fmt.Sprintf("Invalid server address %q: %v", serverAddr, err)
+	}
+
+	c.cfg.Networks[network] = config.Network{
+		Servers:         []string{fmt.Sprintf("%s:%d", server, port)},
+		SSL:             ssl,
+		NickPrefix:      "fun",
+		MaxClientsPerIP: 3,
+		Channels:        []string{},
+		FloodDelayMs:    1000,
+	}
+
+	if c.scaler == nil {
+		return fmt.Sprintf("Network %q added to config (runtime only). Scaling not available outside Kubernetes — start a worker manually with FUNBOT_NETWORK=%s", network, network)
+	}
+
+	ctx := context.Background()
+
+	// Determine the image to use from existing deployments
+	image := "funbot:latest"
+	deployments, err := c.scaler.ListWorkerDeployments(ctx)
+	if err == nil && len(deployments) > 0 {
+		containers := deployments[0].Spec.Template.Spec.Containers
+		if len(containers) > 0 {
+			image = containers[0].Image
+		}
+	}
+
+	if err := c.scaler.CreateWorkerDeployment(ctx, network, image, 1); err != nil {
+		return fmt.Sprintf("Network %q added to config but failed to create deployment: %v", network, err)
+	}
+
+	return fmt.Sprintf("Network %q added. Worker deployment created with 1 replica. Note: this is runtime-only and will not survive controller restart.", network)
+}
+
+// handleDisconnect implements !disconnect <network>.
+// Removes the network's worker Deployment and cleans up.
+func (c *Controller) handleDisconnect(args []string) string {
+	if len(args) == 0 {
+		return "Usage: !disconnect <network>"
+	}
+
+	network := args[0]
+
+	// Don't allow disconnecting the home network
+	if network == c.cfg.Controller.HomeNetwork {
+		return "Cannot disconnect the home network"
+	}
+
+	ctx := context.Background()
+
+	// Send disconnect command to workers so they QUIT cleanly
+	if c.redis != nil {
+		c.publishCommand(fnredis.Command{
+			Type:    "disconnect",
+			Network: network,
+		})
+	}
+
+	// Delete the deployment if we have a scaler
+	if c.scaler != nil {
+		if err := c.scaler.DeleteWorkerDeployment(ctx, network); err != nil {
+			c.log.Warn("failed to delete deployment during disconnect", "network", network, "error", err)
+		}
+	}
+
+	// Remove from runtime config
+	delete(c.cfg.Networks, network)
+
+	return fmt.Sprintf("Disconnected from %s. Workers shutting down.", network)
 }
 
 // parseServerAddr splits "host:port" into components.

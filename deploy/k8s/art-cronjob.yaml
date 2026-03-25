@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funbot-art-update
+  namespace: funbot
+  labels:
+    app: funbot
+    component: art
+spec:
+  schedule: "0 * * * *"  # Every hour
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funbot
+            component: art-update
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: git-pull
+              image: alpine/git:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  if [ -d /data/asciiart/.git ]; then
+                    cd /data/asciiart && git pull --ff-only
+                  else
+                    git clone https://github.com/birdneststream/asciiart.git /data/asciiart
+                  fi
+              volumeMounts:
+                - name: art-data
+                  mountPath: /data/asciiart
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+          volumes:
+            - name: art-data
+              persistentVolumeClaim:
+                claimName: funbot-art

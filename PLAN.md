@@ -414,31 +414,31 @@ The controller's ServiceAccount needs:
 - **Milestone**: Full IRC command set working across networks with proxy support
 
 ### Phase 4: ASCII Art
-- [ ] Git clone/pull management for art repo
-- [ ] Art catalog -- indexing files, search by name/category
-- [ ] Art parser (handle mIRC color codes, line splitting)
-- [ ] Single-client playback with flood control
-- [ ] Multi-client coordinated playback
-- [ ] `!art`, `!artlist`, `!artsearch` commands
+- [x] Git clone/pull management for art repo
+- [x] Art catalog -- indexing files, search by name/category
+- [x] Art parser (handle mIRC color codes, line splitting)
+- [x] Single-client playback with flood control
+- [x] Multi-client coordinated playback
+- [x] `!art`, `!artlist`, `!artsearch` commands
 - **Milestone**: Art plays correctly in channels, multi-client coordination works
 
 ### Phase 5: Kubernetes & Scaling
-- [ ] Kubernetes manifests (all resources listed in 9.1)
-- [ ] Controller scaler -- detect capacity shortage, prompt user, scale Deployments
-- [ ] Runtime network addition (`!connect` creates Deployment via API)
-- [ ] RBAC setup
-- [ ] Art CronJob for repo updates
-- [ ] Health checks (liveness/readiness probes)
-- [ ] Graceful shutdown (SIGTERM handling, clean IRC QUIT)
+- [x] Kubernetes manifests (all resources listed in 9.1)
+- [x] Controller scaler -- detect capacity shortage, prompt user, scale Deployments
+- [x] Runtime network addition (`!connect` creates Deployment via API)
+- [x] RBAC setup
+- [x] Art CronJob for repo updates
+- [x] Health checks (liveness/readiness probes)
+- [x] Graceful shutdown (SIGTERM handling, clean IRC QUIT)
 - **Milestone**: Full system running in Kubernetes, scaling works
 
 ### Phase 6: Polish & Hardening
-- [ ] Reconnection logic (network drops, server disconnects)
-- [ ] Error handling and edge cases
-- [ ] Comprehensive structured logging
-- [ ] Connection pooling for proxies
-- [ ] Rate limiting safety nets (never exceed network flood limits)
-- [ ] Integration testing with a local IRC server (e.g., `ergo`)
+- [x] Reconnection logic (network drops, server disconnects)
+- [x] Error handling and edge cases
+- [x] Comprehensive structured logging
+- [x] Connection pooling for proxies
+- [x] Rate limiting safety nets (never exceed network flood limits)
+- [x] Integration testing with a local IRC server (e.g., `ergo`)
 - **Milestone**: Production-ready
 
 ## 11. Testing Strategy

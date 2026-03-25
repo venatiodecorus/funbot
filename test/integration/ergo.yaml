@@ -1,0 +1,50 @@
+# Minimal ergo configuration for integration testing
+network:
+  name: TestNet
+
+server:
+  name: irc.test.local
+  listeners:
+    ":6667":
+      tls: {}
+  max-sendq: 96k
+  connection-limits:
+    enabled: false
+  connection-throttling:
+    enabled: false
+
+accounts:
+  registration:
+    enabled: false
+  authentication-enabled: false
+
+channels:
+  default-modes: ""
+  registration:
+    enabled: false
+
+history:
+  enabled: false
+
+limits:
+  nicklen: 32
+  identlen: 20
+  channellen: 64
+  topiclen: 390
+  whowas-entries: 0
+  monitor-entries: 0
+  linelen:
+    tags: 512
+    rest: 512
+
+oper-classes:
+  local-oper:
+    title: Local Operator
+    capabilities: []
+
+opers: {}
+
+logging:
+  - method: stderr
+    type: "*"
+    level: warn

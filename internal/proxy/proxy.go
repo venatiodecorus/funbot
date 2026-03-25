@@ -3,13 +3,28 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+const (
+	// DefaultHealthCheckInterval is how often to check unhealthy proxies.
+	DefaultHealthCheckInterval = 2 * time.Minute
+
+	// DefaultHealthCheckTimeout is the timeout for proxy health checks.
+	DefaultHealthCheckTimeout = 10 * time.Second
+
+	// DefaultRecoveryDelay is the minimum time after failure before retrying.
+	DefaultRecoveryDelay = 1 * time.Minute
 )
 
 // Proxy represents a single SOCKS5 proxy.
@@ -20,6 +35,7 @@ type Proxy struct {
 	Username string
 	Password string
 	Healthy  bool
+	InUse    bool // Whether this proxy is assigned to an active client
 	LastUsed time.Time
 	LastFail time.Time
 	UseCount int
@@ -122,44 +138,101 @@ func (p *Pool) Reload() error {
 		return fmt.Errorf("no source file to reload from")
 	}
 
+	p.log.Info("reloading proxies", "file", file)
 	return p.LoadFromFile(file)
 }
 
 // Acquire returns the next available healthy proxy and marks it as in use.
-// Returns nil if no healthy proxies are available.
+// Returns nil if no healthy proxies are available. Prefers proxies that
+// are not currently in use; falls back to least-recently-used healthy proxy.
 func (p *Pool) Acquire() *Proxy {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Find the least-recently-used healthy proxy
+	// First pass: find the least-recently-used healthy proxy that is NOT in use
 	var best *Proxy
-	for _, proxy := range p.proxies {
-		if !proxy.Healthy {
+	for _, px := range p.proxies {
+		if !px.Healthy || px.InUse {
 			continue
 		}
-		if best == nil || proxy.LastUsed.Before(best.LastUsed) {
-			best = proxy
+		if best == nil || px.LastUsed.Before(best.LastUsed) {
+			best = px
+		}
+	}
+
+	// Second pass: if all healthy proxies are in use, allow reuse
+	// (multiple clients may share a proxy if pool is small)
+	if best == nil {
+		for _, px := range p.proxies {
+			if !px.Healthy {
+				continue
+			}
+			if best == nil || px.UseCount < best.UseCount {
+				best = px
+			}
 		}
 	}
 
 	if best != nil {
+		best.InUse = true
 		best.LastUsed = time.Now()
 		best.UseCount++
+		p.log.Debug("proxy acquired",
+			"proxy", best.ProxyAddress(),
+			"use_count", best.UseCount,
+			"in_use", p.inUseCountLocked(),
+			"available", p.availableCountLocked(),
+		)
+	} else {
+		p.log.Warn("no healthy proxies available", "total", len(p.proxies))
 	}
 
 	return best
 }
 
 // Release marks a proxy as no longer in active use.
-// If failed is true, the proxy is marked unhealthy.
-func (p *Pool) Release(proxy *Proxy, failed bool) {
+// If failed is true, the proxy is also marked unhealthy.
+func (p *Pool) Release(px *Proxy, failed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	px.InUse = false
+
 	if failed {
-		proxy.Healthy = false
-		proxy.LastFail = time.Now()
-		p.log.Warn("proxy marked unhealthy", "proxy", proxy.Host+":"+proxy.Port)
+		px.Healthy = false
+		px.LastFail = time.Now()
+		p.log.Warn("proxy released and marked unhealthy",
+			"proxy", px.ProxyAddress(),
+			"in_use", p.inUseCountLocked(),
+			"available", p.availableCountLocked(),
+		)
+	} else {
+		p.log.Debug("proxy released",
+			"proxy", px.ProxyAddress(),
+			"in_use", p.inUseCountLocked(),
+			"available", p.availableCountLocked(),
+		)
+	}
+}
+
+// ReleaseByAddress releases a proxy matching the given address.
+// This is useful when the caller only has the address string (e.g., from irc.Client).
+func (p *Pool) ReleaseByAddress(addr string, failed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, px := range p.proxies {
+		if px.ProxyAddress() == addr {
+			px.InUse = false
+			if failed {
+				px.Healthy = false
+				px.LastFail = time.Now()
+				p.log.Warn("proxy released by address and marked unhealthy", "proxy", addr)
+			} else {
+				p.log.Debug("proxy released by address", "proxy", addr)
+			}
+			return
+		}
 	}
 }
 
@@ -183,8 +256,44 @@ func (p *Pool) HealthyCount() int {
 	defer p.mu.RUnlock()
 
 	count := 0
-	for _, proxy := range p.proxies {
-		if proxy.Healthy {
+	for _, px := range p.proxies {
+		if px.Healthy {
+			count++
+		}
+	}
+	return count
+}
+
+// InUseCount returns the number of proxies currently assigned to clients.
+func (p *Pool) InUseCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.inUseCountLocked()
+}
+
+// AvailableCount returns the number of healthy proxies not currently in use.
+func (p *Pool) AvailableCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.availableCountLocked()
+}
+
+// inUseCountLocked returns in-use count (caller must hold lock).
+func (p *Pool) inUseCountLocked() int {
+	count := 0
+	for _, px := range p.proxies {
+		if px.InUse {
+			count++
+		}
+	}
+	return count
+}
+
+// availableCountLocked returns available count (caller must hold lock).
+func (p *Pool) availableCountLocked() int {
+	count := 0
+	for _, px := range p.proxies {
+		if px.Healthy && !px.InUse {
 			count++
 		}
 	}
@@ -219,6 +328,81 @@ func (px *Proxy) String() string {
 		status = "unhealthy"
 	}
 	return fmt.Sprintf("socks5://%s:%s (%s, used %d times)", px.Host, px.Port, status, px.UseCount)
+}
+
+// StartHealthChecker runs a background goroutine that periodically tests
+// unhealthy proxies and marks them healthy again if they recover.
+func (p *Pool) StartHealthChecker(ctx context.Context) {
+	ticker := time.NewTicker(DefaultHealthCheckInterval)
+	defer ticker.Stop()
+
+	p.log.Info("proxy health checker started", "interval", DefaultHealthCheckInterval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			p.log.Info("proxy health checker stopped")
+			return
+		case <-ticker.C:
+			p.checkUnhealthyProxies(ctx)
+		}
+	}
+}
+
+// checkUnhealthyProxies tests all unhealthy proxies and marks recovered ones healthy.
+func (p *Pool) checkUnhealthyProxies(ctx context.Context) {
+	p.mu.RLock()
+	var unhealthy []*Proxy
+	for _, px := range p.proxies {
+		if !px.Healthy && time.Since(px.LastFail) >= DefaultRecoveryDelay {
+			unhealthy = append(unhealthy, px)
+		}
+	}
+	p.mu.RUnlock()
+
+	if len(unhealthy) == 0 {
+		return
+	}
+
+	p.log.Debug("checking unhealthy proxies", "count", len(unhealthy))
+
+	for _, px := range unhealthy {
+		if ctx.Err() != nil {
+			return
+		}
+		if p.testProxy(px) {
+			p.MarkHealthy(px)
+			p.log.Info("proxy recovered", "proxy", px.Host+":"+px.Port)
+		}
+	}
+}
+
+// testProxy checks if a proxy is reachable by establishing a SOCKS5 connection.
+func (p *Pool) testProxy(px *Proxy) bool {
+	var auth *proxy.Auth
+	if px.Username != "" {
+		auth = &proxy.Auth{
+			User:     px.Username,
+			Password: px.Password,
+		}
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", px.ProxyAddress(), auth, &net.Dialer{
+		Timeout: DefaultHealthCheckTimeout,
+	})
+	if err != nil {
+		p.log.Debug("proxy health check failed (dialer)", "proxy", px.ProxyAddress(), "error", err)
+		return false
+	}
+
+	// Try to establish a connection through the proxy to a well-known address
+	conn, err := dialer.Dial("tcp", "irc.efnet.org:6667")
+	if err != nil {
+		p.log.Debug("proxy health check failed (dial)", "proxy", px.ProxyAddress(), "error", err)
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // parseProxy parses a proxy URL string into a Proxy struct.

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: funbot-controller
+  namespace: funbot
+  labels:
+    app: funbot
+    component: controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Only one controller at a time
+  selector:
+    matchLabels:
+      app: funbot
+      component: controller
+  template:
+    metadata:
+      labels:
+        app: funbot
+        component: controller
+    spec:
+      serviceAccountName: funbot-controller
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: controller
+          image: funbot:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role=controller"]
+          env:
+            - name: FUNBOT_ROLE
+              value: "controller"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/funbot
+              readOnly: true
+            - name: proxies
+              mountPath: /etc/funbot/proxies
+              readOnly: true
+            - name: art-data
+              mountPath: /data/asciiart
+      volumes:
+        - name: config
+          configMap:
+            name: funbot-config
+        - name: proxies
+          secret:
+            secretName: funbot-proxies
+        - name: art-data
+          persistentVolumeClaim:
+            claimName: funbot-art

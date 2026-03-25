@@ -21,10 +21,11 @@ type KeepNick struct {
 	interval    time.Duration
 	log         *slog.Logger
 
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	active   bool
-	acquired bool
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	active     bool
+	acquired   bool
+	handlerIDs []string // girc handler IDs for cleanup
 }
 
 // NewKeepNick creates a new keepnick manager for the given client.
@@ -55,8 +56,7 @@ func (kn *KeepNick) Start(ctx context.Context) {
 	kn.log.Info("keepnick started")
 
 	// Register a QUIT handler to detect when the nick holder leaves
-	quitID := "keepnick-quit-" + kn.client.ID()
-	kn.client.GircClient().Handlers.AddBg(girc.QUIT, func(gc *girc.Client, e girc.Event) {
+	quitCUID := kn.client.GircClient().Handlers.AddBg(girc.QUIT, func(gc *girc.Client, e girc.Event) {
 		if e.Source != nil && e.Source.Name == kn.desiredNick {
 			kn.log.Info("nick holder quit, attempting nick change")
 			kn.attemptNick()
@@ -64,8 +64,7 @@ func (kn *KeepNick) Start(ctx context.Context) {
 	})
 
 	// Register a NICK handler to detect when someone changes away from the desired nick
-	nickID := "keepnick-nick-" + kn.client.ID()
-	kn.client.GircClient().Handlers.AddBg(girc.NICK, func(gc *girc.Client, e girc.Event) {
+	nickCUID := kn.client.GircClient().Handlers.AddBg(girc.NICK, func(gc *girc.Client, e girc.Event) {
 		// If the old nick was our desired nick and it wasn't us who changed
 		if e.Source != nil && e.Source.Name == kn.desiredNick && e.Source.Name != kn.client.Nick() {
 			kn.log.Info("nick holder changed nick, attempting to acquire")
@@ -80,14 +79,22 @@ func (kn *KeepNick) Start(ctx context.Context) {
 		}
 	})
 
+	// Store handler IDs for cleanup
+	kn.mu.Lock()
+	kn.handlerIDs = []string{quitCUID, nickCUID}
+	kn.mu.Unlock()
+
 	go func() {
 		defer func() {
-			// Clean up handlers
-			_ = quitID
-			_ = nickID
+			// Remove handlers from girc client to prevent leaks
 			kn.mu.Lock()
+			for _, id := range kn.handlerIDs {
+				kn.client.GircClient().Handlers.Remove(id)
+			}
+			kn.handlerIDs = nil
 			kn.active = false
 			kn.mu.Unlock()
+			kn.log.Debug("keepnick handlers cleaned up")
 		}()
 
 		// Attempt immediately
@@ -112,7 +119,8 @@ func (kn *KeepNick) Start(ctx context.Context) {
 	}()
 }
 
-// Stop cancels the keepnick process.
+// Stop cancels the keepnick process. Handler cleanup happens
+// asynchronously when the goroutine exits.
 func (kn *KeepNick) Stop() {
 	kn.mu.Lock()
 	defer kn.mu.Unlock()
@@ -121,7 +129,7 @@ func (kn *KeepNick) Stop() {
 		kn.cancel()
 		kn.cancel = nil
 	}
-	kn.active = false
+	// Note: active will be set to false by the goroutine's defer
 }
 
 // IsActive returns whether keepnick is currently running.

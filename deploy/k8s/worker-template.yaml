@@ -1,0 +1,93 @@
+# Worker Deployment template.
+# Copy this file and replace NETWORK_NAME with the actual network name
+# (e.g., "efnet", "undernet"). Each network gets its own Deployment.
+#
+# Example: cp worker-template.yaml worker-efnet.yaml
+#   Then: sed -i 's/NETWORK_NAME/efnet/g' worker-efnet.yaml
+#
+# The controller can also create these Deployments at runtime via
+# the !connect command.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: funbot-worker-NETWORK_NAME
+  namespace: funbot
+  labels:
+    app: funbot
+    component: worker
+    network: NETWORK_NAME
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: funbot
+      component: worker
+      network: NETWORK_NAME
+  template:
+    metadata:
+      labels:
+        app: funbot
+        component: worker
+        network: NETWORK_NAME
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: worker
+          image: funbot:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--role=worker", "--network=NETWORK_NAME"]
+          env:
+            - name: FUNBOT_ROLE
+              value: "worker"
+            - name: FUNBOT_NETWORK
+              value: "NETWORK_NAME"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/funbot
+              readOnly: true
+            - name: proxies
+              mountPath: /etc/funbot/proxies
+              readOnly: true
+            - name: art-data
+              mountPath: /data/asciiart
+      volumes:
+        - name: config
+          configMap:
+            name: funbot-config
+        - name: proxies
+          secret:
+            secretName: funbot-proxies
+        - name: art-data
+          persistentVolumeClaim:
+            claimName: funbot-art

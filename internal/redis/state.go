@@ -123,11 +123,13 @@ func (c *Client) GetAllNetworkStates(ctx context.Context) (map[string][]PodState
 	for _, key := range keys {
 		data, err := c.rdb.Get(ctx, key).Result()
 		if err != nil {
+			c.log.Warn("failed to get state key", "key", key, "error", err)
 			continue
 		}
 
 		var state PodState
 		if err := json.Unmarshal([]byte(data), &state); err != nil {
+			c.log.Warn("failed to unmarshal state", "key", key, "error", err)
 			continue
 		}
 		result[state.Network] = append(result[state.Network], state)
@@ -226,7 +228,10 @@ func (c *Client) CountAvailableClients(ctx context.Context, network string) (int
 // DeleteState removes a pod's state from Redis.
 func (c *Client) DeleteState(ctx context.Context, network, pod string) error {
 	key := StateKey(network, pod)
-	return c.rdb.Del(ctx, key).Err()
+	if err := c.rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("deleting state key %s: %w", key, err)
+	}
+	return nil
 }
 
 // parseNetworkFromKey extracts the network name from a state key.

@@ -77,6 +77,7 @@ func (c *Client) PublishAck(ctx context.Context, ack CommandAck) error {
 		return fmt.Errorf("publishing ack: %w", err)
 	}
 
+	c.log.Debug("published ack", "command_id", ack.CommandID, "success", ack.Success)
 	return nil
 }
 

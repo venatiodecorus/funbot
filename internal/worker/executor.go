@@ -5,24 +5,35 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
+	"github.com/venatiodecorus/funbot/internal/art"
+	"github.com/venatiodecorus/funbot/internal/config"
 	fnredis "github.com/venatiodecorus/funbot/internal/redis"
 )
 
 // Executor handles incoming commands from Redis and applies them
 // to the local client manager.
 type Executor struct {
-	cm  *ClientManager
-	ctx context.Context // parent context for long-running operations like keepnick
-	log *slog.Logger
+	cm         *ClientManager
+	catalog    *art.Catalog
+	cfg        *config.Config
+	ctx        context.Context    // parent context for long-running operations like keepnick
+	cancelFunc context.CancelFunc // called on disconnect command to trigger worker shutdown
+	log        *slog.Logger
 }
 
 // NewExecutor creates a new command executor for the given client manager.
-func NewExecutor(ctx context.Context, cm *ClientManager, log *slog.Logger) *Executor {
+// The cancelFunc is called when a disconnect command is received,
+// triggering graceful shutdown of the worker.
+func NewExecutor(ctx context.Context, cancelFunc context.CancelFunc, cm *ClientManager, catalog *art.Catalog, cfg *config.Config, log *slog.Logger) *Executor {
 	return &Executor{
-		cm:  cm,
-		ctx: ctx,
-		log: log.With("component", "executor", "network", cm.Network()),
+		cm:         cm,
+		catalog:    catalog,
+		cfg:        cfg,
+		ctx:        ctx,
+		cancelFunc: cancelFunc,
+		log:        log.With("component", "executor", "network", cm.Network()),
 	}
 }
 
@@ -58,9 +69,31 @@ func (e *Executor) Execute(cmd fnredis.Command) fnredis.CommandAck {
 	case "raw":
 		ack.Message = e.execRaw(cmd)
 		ack.Success = true
+	case "art":
+		msg, ok := e.execArt(cmd)
+		ack.Message = msg
+		ack.Success = ok
+	case "disconnect":
+		ack.Message = "disconnecting"
+		ack.Success = true
+		// Trigger graceful shutdown after sending ack
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			if e.cancelFunc != nil {
+				e.cancelFunc()
+			}
+		}()
 	default:
 		ack.Success = false
 		ack.Message = fmt.Sprintf("unknown command type: %s", cmd.Type)
+		e.log.Warn("unknown command type", "type", cmd.Type, "id", cmd.ID)
+	}
+
+	// Log command result for operational visibility
+	if ack.Success {
+		e.log.Info("command completed", "type", cmd.Type, "id", cmd.ID, "message", ack.Message)
+	} else {
+		e.log.Warn("command failed", "type", cmd.Type, "id", cmd.ID, "message", ack.Message)
 	}
 
 	return ack
@@ -197,6 +230,66 @@ func (e *Executor) execSay(cmd fnredis.Command) string {
 	}
 
 	return fmt.Sprintf("sent message to %s from %d client(s)", channel, len(clients))
+}
+
+// execArt plays ASCII art in a channel using coordinated multi-client playback.
+func (e *Executor) execArt(cmd fnredis.Command) (string, bool) {
+	if e.catalog == nil {
+		return "art catalog not initialized", false
+	}
+
+	// Args[0] should be the art name
+	if len(cmd.Args) == 0 {
+		return "no art name specified", false
+	}
+
+	artName := cmd.Args[0]
+	channel := cmd.Channel
+	if channel == "" {
+		return "no channel specified for art playback", false
+	}
+
+	// Find the art file
+	entries := e.catalog.FindByName(artName)
+	if len(entries) == 0 {
+		return fmt.Sprintf("art %q not found", artName), false
+	}
+
+	// Use the first match
+	entry := entries[0]
+
+	// Load the art lines
+	lines, err := art.LoadArt(entry.Path)
+	if err != nil {
+		return fmt.Sprintf("error loading art %q: %v", artName, err), false
+	}
+	if len(lines) == 0 {
+		return fmt.Sprintf("art %q is empty", artName), false
+	}
+
+	// Select clients for playback
+	clients := e.cm.SelectClients(cmd.Count)
+	if len(clients) == 0 {
+		return "no connected clients available", false
+	}
+
+	// Get flood delay for this network
+	var floodDelay = 500 * time.Millisecond // default
+	if netCfg, ok := e.cfg.Networks[e.cm.Network()]; ok {
+		floodDelay = netCfg.FloodDelay()
+	}
+
+	// Create player and start playback in a goroutine
+	player := art.NewPlayer(floodDelay, e.cm.FloodGuard(), e.log)
+
+	go func() {
+		if err := player.Play(e.ctx, channel, clients, lines); err != nil {
+			e.log.Error("art playback error", "art", artName, "error", err)
+		}
+	}()
+
+	return fmt.Sprintf("playing %q (%d lines) in %s with %d client(s)",
+		artName, len(lines), channel, len(clients)), true
 }
 
 // execRaw sends a raw IRC command.

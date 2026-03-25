@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/venatiodecorus/funbot/internal/config"
 	"github.com/venatiodecorus/funbot/internal/irc"
@@ -18,25 +19,45 @@ import (
 
 // ClientManager manages multiple IRC client connections to a single network.
 type ClientManager struct {
-	network   string
-	netCfg    config.Network
-	podName   string
-	proxyPool *proxy.Pool
-	clients   []*irc.Client
-	keepNicks map[string]*irc.KeepNick // client ID -> keepnick manager
-	mu        sync.RWMutex
-	log       *slog.Logger
+	network    string
+	netCfg     config.Network
+	podName    string
+	proxyPool  *proxy.Pool
+	floodGuard *irc.GlobalFloodGuard
+	clients    []*irc.Client
+	keepNicks  map[string]*irc.KeepNick // client ID -> keepnick manager
+	mu         sync.RWMutex
+	log        *slog.Logger
 }
 
 // NewClientManager creates a new client manager for the given network.
 func NewClientManager(network string, netCfg config.Network, podName string, proxyPool *proxy.Pool, log *slog.Logger) *ClientManager {
+	cmLog := log.With("component", "clientmgr", "network", network)
+
+	// Create a global flood guard for this network.
+	// Burst allows 5 messages, refill rate matches the per-client flood delay.
+	// This prevents the aggregate send rate from all clients exceeding safe limits.
+	floodDelay := netCfg.FloodDelay()
+	if floodDelay <= 0 {
+		floodDelay = 500 * time.Millisecond
+	}
+	// The global guard refills at a faster rate than per-client delay since
+	// multiple clients should be able to send concurrently, but not unbounded.
+	// Allow up to 10 messages per flood delay period as a safety cap.
+	guardRefill := floodDelay / 10
+	if guardRefill < 50*time.Millisecond {
+		guardRefill = 50 * time.Millisecond
+	}
+	floodGuard := irc.NewGlobalFloodGuard(10, guardRefill, cmLog)
+
 	return &ClientManager{
-		network:   network,
-		netCfg:    netCfg,
-		podName:   podName,
-		proxyPool: proxyPool,
-		keepNicks: make(map[string]*irc.KeepNick),
-		log:       log.With("component", "clientmgr", "network", network),
+		network:    network,
+		netCfg:     netCfg,
+		podName:    podName,
+		proxyPool:  proxyPool,
+		floodGuard: floodGuard,
+		keepNicks:  make(map[string]*irc.KeepNick),
+		log:        cmLog,
 	}
 }
 
@@ -71,15 +92,16 @@ func (cm *ClientManager) Start(ctx context.Context) error {
 		nick := fmt.Sprintf("%s%d", cm.netCfg.NickPrefix, i)
 
 		cfg := irc.ClientConfig{
-			ID:       clientID,
-			Network:  cm.network,
-			Server:   server,
-			Port:     port,
-			SSL:      cm.netCfg.SSL,
-			Nick:     nick,
-			User:     "funbot",
-			Realname: "Funbot Worker",
-			Logger:   cm.log,
+			ID:         clientID,
+			Network:    cm.network,
+			Server:     server,
+			Port:       port,
+			SSL:        cm.netCfg.SSL,
+			Nick:       nick,
+			User:       "funbot",
+			Realname:   "Funbot Worker",
+			Logger:     cm.log,
+			FloodDelay: cm.netCfg.FloodDelay(),
 		}
 
 		// Clients beyond max_clients_per_ip use proxies
@@ -110,12 +132,12 @@ func (cm *ClientManager) Start(ctx context.Context) error {
 		wg.Add(1)
 		go func(c *irc.Client, id string) {
 			defer wg.Done()
-			cm.log.Info("connecting client", "client_id", id)
-			if err := c.Connect(ctx); err != nil {
+			cm.log.Info("connecting client with auto-reconnect", "client_id", id)
+			if err := c.ConnectWithRetry(ctx, 0); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				cm.log.Error("client connection failed", "client_id", id, "error", err)
+				cm.log.Error("client connection failed permanently", "client_id", id, "error", err)
 				// If this was a proxied connection, mark the proxy as failed
 				if c.ProxyAddr() != "" && cm.proxyPool != nil {
 					for _, px := range cm.proxyPool.All() {
@@ -139,15 +161,21 @@ func (cm *ClientManager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop disconnects all clients.
+// Stop gracefully disconnects all clients by sending QUIT messages.
 func (cm *ClientManager) Stop() {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	for _, client := range cm.clients {
-		client.Close()
+	// Stop all keepnick goroutines first
+	for id, kn := range cm.keepNicks {
+		kn.Stop()
+		cm.log.Debug("stopped keepnick", "client_id", id)
 	}
-	cm.log.Info("all clients stopped")
+
+	for _, client := range cm.clients {
+		client.Quit("shutting down")
+	}
+	cm.log.Info("all clients stopped with QUIT")
 }
 
 // Clients returns a snapshot of all managed clients.
@@ -271,6 +299,11 @@ func (cm *ClientManager) GetState() fnredis.PodState {
 		Network: cm.network,
 		Clients: clients,
 	}
+}
+
+// FloodGuard returns the global flood guard for this network.
+func (cm *ClientManager) FloodGuard() *irc.GlobalFloodGuard {
+	return cm.floodGuard
 }
 
 // Network returns the network name.
