@@ -398,11 +398,11 @@ The controller's ServiceAccount needs:
 - **Milestone**: Bot connects to one network, responds to authorized commands
 
 ### Phase 2: Multi-Client & Redis
-- [ ] Redis client setup, pub/sub helpers, state read/write
-- [ ] ClientManager -- manage N clients per pod as goroutines
-- [ ] Worker role: subscribe to Redis commands, execute, report status
-- [ ] Controller role: parse IRC commands, publish to Redis, aggregate status
-- [ ] Status reporting (heartbeat -> Redis -> controller -> IRC)
+- [x] Redis client setup, pub/sub helpers, state read/write
+- [x] ClientManager -- manage N clients per pod as goroutines
+- [x] Worker role: subscribe to Redis commands, execute, report status
+- [x] Controller role: parse IRC commands, publish to Redis, aggregate status
+- [x] Status reporting (heartbeat -> Redis -> controller -> IRC)
 - **Milestone**: Controller on home net, worker on test net, commands flow end-to-end
 
 ### Phase 3: Advanced IRC Features
