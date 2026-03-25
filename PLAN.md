@@ -406,11 +406,11 @@ The controller's ServiceAccount needs:
 - **Milestone**: Controller on home net, worker on test net, commands flow end-to-end
 
 ### Phase 3: Advanced IRC Features
-- [ ] Keepnick implementation
-- [ ] Multi-client PM (`!pm` with count)
-- [ ] Multi-client channel messaging (`!say`)
-- [ ] Proxy support (loading, assignment, health checking)
-- [ ] `!raw` command
+- [x] Keepnick implementation
+- [x] Multi-client PM (`!pm` with count)
+- [x] Multi-client channel messaging (`!say`)
+- [x] Proxy support (loading, assignment, health checking)
+- [x] `!raw` command
 - **Milestone**: Full IRC command set working across networks with proxy support
 
 ### Phase 4: ASCII Art

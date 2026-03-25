@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/venatiodecorus/funbot/internal/config"
+	"github.com/venatiodecorus/funbot/internal/proxy"
 	fnredis "github.com/venatiodecorus/funbot/internal/redis"
 )
 
@@ -17,12 +18,13 @@ const StatusInterval = 10 * time.Second
 // Worker manages IRC clients for a single network and communicates
 // with the controller via Redis.
 type Worker struct {
-	cfg      *config.Config
-	network  string
-	redis    *fnredis.Client
-	cm       *ClientManager
-	executor *Executor
-	log      *slog.Logger
+	cfg       *config.Config
+	network   string
+	redis     *fnredis.Client
+	cm        *ClientManager
+	executor  *Executor
+	proxyPool *proxy.Pool
+	log       *slog.Logger
 }
 
 // New creates a new Worker for the given network.
@@ -34,16 +36,28 @@ func New(cfg *config.Config, network string, redisClient *fnredis.Client, log *s
 
 	podName := getPodName()
 
-	cm := NewClientManager(network, netCfg, podName, log)
-	executor := NewExecutor(cm, log)
+	// Set up proxy pool
+	proxyPool := proxy.NewPool(log)
+	if cfg.Proxies.File != "" {
+		if err := proxyPool.LoadFromFile(cfg.Proxies.File); err != nil {
+			log.Warn("failed to load proxy file", "error", err)
+		}
+	}
+	if len(cfg.Proxies.List) > 0 {
+		if err := proxyPool.LoadFromList(cfg.Proxies.List); err != nil {
+			log.Warn("failed to load proxy list", "error", err)
+		}
+	}
+
+	cm := NewClientManager(network, netCfg, podName, proxyPool, log)
 
 	return &Worker{
-		cfg:      cfg,
-		network:  network,
-		redis:    redisClient,
-		cm:       cm,
-		executor: executor,
-		log:      log.With("component", "worker", "network", network, "pod", podName),
+		cfg:       cfg,
+		network:   network,
+		redis:     redisClient,
+		cm:        cm,
+		proxyPool: proxyPool,
+		log:       log.With("component", "worker", "network", network, "pod", podName),
 	}, nil
 }
 
@@ -51,6 +65,9 @@ func New(cfg *config.Config, network string, redisClient *fnredis.Client, log *s
 // and begins status reporting. Blocks until context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
 	w.log.Info("starting worker")
+
+	// Create executor with the context (needed for keepnick)
+	w.executor = NewExecutor(ctx, w.cm, w.log)
 
 	// Start IRC clients
 	if err := w.cm.Start(ctx); err != nil {
@@ -121,7 +138,6 @@ func (w *Worker) publishState(ctx context.Context) {
 
 // getPodName returns the pod name from the environment or a default.
 func getPodName() string {
-	// In Kubernetes, the pod name is typically in HOSTNAME
 	if name := os.Getenv("HOSTNAME"); name != "" {
 		return name
 	}

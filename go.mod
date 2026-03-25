@@ -7,6 +7,7 @@ require (
 	github.com/lrstanley/girc v1.1.1
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/spf13/viper v1.21.0
+	golang.org/x/net v0.52.0
 )
 
 require (

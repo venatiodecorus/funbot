@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,13 +13,15 @@ import (
 // to the local client manager.
 type Executor struct {
 	cm  *ClientManager
+	ctx context.Context // parent context for long-running operations like keepnick
 	log *slog.Logger
 }
 
 // NewExecutor creates a new command executor for the given client manager.
-func NewExecutor(cm *ClientManager, log *slog.Logger) *Executor {
+func NewExecutor(ctx context.Context, cm *ClientManager, log *slog.Logger) *Executor {
 	return &Executor{
 		cm:  cm,
+		ctx: ctx,
 		log: log.With("component", "executor", "network", cm.Network()),
 	}
 }
@@ -42,6 +45,9 @@ func (e *Executor) Execute(cmd fnredis.Command) fnredis.CommandAck {
 		ack.Success = true
 	case "nick":
 		ack.Message = e.execNick(cmd)
+		ack.Success = true
+	case "keepnick":
+		ack.Message = e.execKeepNick(cmd)
 		ack.Success = true
 	case "pm":
 		ack.Message = e.execPM(cmd)
@@ -133,6 +139,22 @@ func (e *Executor) execNick(cmd fnredis.Command) string {
 
 	client.SetNick(newNick)
 	return fmt.Sprintf("changing nick for %s to %s", target, newNick)
+}
+
+// execKeepNick starts or stops keepnick for a client.
+func (e *Executor) execKeepNick(cmd fnredis.Command) string {
+	if len(cmd.Args) < 2 {
+		return "usage: keepnick <client_id> <desirednick|stop>"
+	}
+
+	clientID := cmd.Args[0]
+	desiredNick := cmd.Args[1]
+
+	if desiredNick == "stop" {
+		return e.cm.StopKeepNick(clientID)
+	}
+
+	return e.cm.StartKeepNick(e.ctx, clientID, desiredNick)
 }
 
 // execPM sends a private message from multiple clients.

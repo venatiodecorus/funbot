@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/lrstanley/girc"
+	"golang.org/x/net/proxy"
 )
 
 // MessageHandler is called when the client receives a PRIVMSG.
@@ -30,6 +31,9 @@ type Client struct {
 	connected bool
 	nick      string
 	channels  []string
+	proxyAddr string // SOCKS5 proxy used for this connection (empty if direct)
+	proxyUser string // SOCKS5 proxy username
+	proxyPass string // SOCKS5 proxy password
 
 	onPrivmsg MessageHandler
 	onConnect ConnectHandler
@@ -37,15 +41,18 @@ type Client struct {
 
 // ClientConfig holds the configuration for creating a new IRC client.
 type ClientConfig struct {
-	ID       string
-	Network  string
-	Server   string
-	Port     int
-	SSL      bool
-	Nick     string
-	User     string
-	Realname string
-	Logger   *slog.Logger
+	ID        string
+	Network   string
+	Server    string
+	Port      int
+	SSL       bool
+	Nick      string
+	User      string
+	Realname  string
+	Logger    *slog.Logger
+	ProxyAddr string // SOCKS5 proxy address (host:port), empty for direct
+	ProxyUser string // SOCKS5 proxy username (optional)
+	ProxyPass string // SOCKS5 proxy password (optional)
 }
 
 // New creates a new IRC client with the given configuration.
@@ -74,11 +81,14 @@ func New(cfg ClientConfig) *Client {
 	log = log.With("client_id", cfg.ID, "network", cfg.Network)
 
 	c := &Client{
-		id:      cfg.ID,
-		network: cfg.Network,
-		gircCli: gircCli,
-		log:     log,
-		nick:    cfg.Nick,
+		id:        cfg.ID,
+		network:   cfg.Network,
+		gircCli:   gircCli,
+		log:       log,
+		nick:      cfg.Nick,
+		proxyAddr: cfg.ProxyAddr,
+		proxyUser: cfg.ProxyUser,
+		proxyPass: cfg.ProxyPass,
 	}
 
 	// Register handlers
@@ -124,13 +134,23 @@ func New(cfg ClientConfig) *Client {
 }
 
 // Connect establishes the IRC connection. It blocks until the connection
-// is closed or the context is cancelled.
+// is closed or the context is cancelled. If a proxy is configured, the
+// connection will be routed through the SOCKS5 proxy.
 func (c *Client) Connect(ctx context.Context) error {
-	c.log.Info("connecting to IRC")
+	c.log.Info("connecting to IRC", "proxy", c.proxyAddr)
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.gircCli.Connect()
+		if c.proxyAddr != "" {
+			dialer, err := c.createProxyDialer()
+			if err != nil {
+				errCh <- fmt.Errorf("creating proxy dialer: %w", err)
+				return
+			}
+			errCh <- c.gircCli.DialerConnect(dialer)
+		} else {
+			errCh <- c.gircCli.Connect()
+		}
 	}()
 
 	select {
@@ -143,6 +163,28 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 		return nil
 	}
+}
+
+// createProxyDialer creates a SOCKS5 proxy dialer from the client config.
+func (c *Client) createProxyDialer() (proxy.Dialer, error) {
+	var auth *proxy.Auth
+	if c.proxyUser != "" {
+		auth = &proxy.Auth{
+			User:     c.proxyUser,
+			Password: c.proxyPass,
+		}
+	}
+	dialer, err := proxy.SOCKS5("tcp", c.proxyAddr, auth, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("creating SOCKS5 dialer for %s: %w", c.proxyAddr, err)
+	}
+	return dialer, nil
+}
+
+// ProxyAddr returns the SOCKS5 proxy address used for this connection,
+// or an empty string if using a direct connection.
+func (c *Client) ProxyAddr() string {
+	return c.proxyAddr
 }
 
 // Close cleanly disconnects from IRC.

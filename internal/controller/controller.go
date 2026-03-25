@@ -190,6 +190,7 @@ func (c *Controller) registerCommands() {
 	c.dispatcher.Register("join", c.handleJoin)
 	c.dispatcher.Register("part", c.handlePart)
 	c.dispatcher.Register("nick", c.handleNick)
+	c.dispatcher.Register("keepnick", c.handleKeepNick)
 	c.dispatcher.Register("pm", c.handlePM)
 	c.dispatcher.Register("say", c.handleSay)
 	c.dispatcher.Register("raw", c.handleRaw)
@@ -488,6 +489,38 @@ func (c *Controller) handleRaw(args []string) string {
 
 	return c.publishCommand(fnredis.Command{
 		Type:    "raw",
+		Network: network,
+		Args:    cmdArgs,
+	})
+}
+
+// handleKeepNick implements !keepnick [network] <client_id> <desirednick|stop>.
+func (c *Controller) handleKeepNick(args []string) string {
+	if len(args) < 2 {
+		return "Usage: !keepnick [network] <client_id> <desirednick|stop>"
+	}
+
+	network := ""
+	cmdArgs := args
+
+	// Check if first arg is a network
+	if _, exists := c.cfg.Networks[args[0]]; exists {
+		network = args[0]
+		cmdArgs = args[1:]
+	} else {
+		network = c.cmdCtx.Network()
+	}
+
+	if network == "" {
+		return "No network specified and no context set"
+	}
+
+	if len(cmdArgs) < 2 {
+		return "Usage: !keepnick [network] <client_id> <desirednick|stop>"
+	}
+
+	return c.publishCommand(fnredis.Command{
+		Type:    "keepnick",
 		Network: network,
 		Args:    cmdArgs,
 	})
