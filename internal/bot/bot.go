@@ -78,14 +78,23 @@ func New(cfg *config.Config, log *slog.Logger) (*Bot, error) {
 
 	// Set up proxy pool
 	proxyPool := proxy.NewPool(log)
-	if cfg.Proxies.APIURL != "" {
-		proxyPool.SetAPI(cfg.Proxies.APIURL, cfg.Proxies.Protocol, cfg.Proxies.MaxLatency)
-	}
 	if cfg.Proxies.MaxRetries > 0 {
 		proxyPool.SetMaxRetries(cfg.Proxies.MaxRetries)
 	}
-	if cfg.Proxies.MinPoolSize > 0 {
-		proxyPool.SetMinPoolSize(cfg.Proxies.MinPoolSize)
+
+	switch cfg.Proxies.Source {
+	case config.ProxySourceRotating:
+		proxyPool.SetRotatingProxy(cfg.Proxies.RotatingAddr, cfg.Proxies.RotatingUser, cfg.Proxies.RotatingPass)
+		log.Info("proxy pool configured with rotating proxy",
+			"addr", cfg.Proxies.RotatingAddr)
+	default:
+		// "api" or empty (backwards compatible default)
+		if cfg.Proxies.APIURL != "" {
+			proxyPool.SetAPI(cfg.Proxies.APIURL, cfg.Proxies.Protocol, cfg.Proxies.MaxLatency)
+		}
+		if cfg.Proxies.MinPoolSize > 0 {
+			proxyPool.SetMinPoolSize(cfg.Proxies.MinPoolSize)
+		}
 	}
 
 	// Set up art repo and catalog
@@ -150,13 +159,15 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}
 
-	// Fetch initial proxies from API
-	if b.cfg.Proxies.APIURL != "" {
+	// Initialize proxy pool based on source type
+	if b.proxyPool.IsRotating() {
+		b.log.Info("using rotating proxy source, no API fetch needed")
+	} else if b.cfg.Proxies.APIURL != "" {
+		// API source: fetch initial proxies and start background refresher
 		if err := b.proxyPool.FetchFromAPI(ctx); err != nil {
 			b.log.Warn("failed to fetch initial proxies from API", "error", err)
 		}
 
-		// Start background refresher
 		refreshInterval := DefaultProxyRefreshInterval
 		if b.cfg.Proxies.RefreshInterval != "" {
 			if d, err := time.ParseDuration(b.cfg.Proxies.RefreshInterval); err == nil {
@@ -264,8 +275,14 @@ func (b *Bot) handleStatus(args []string) string {
 	)
 
 	// Proxy pool status
-	proxyStatus := fmt.Sprintf("Proxies: %d total, %d healthy",
-		b.proxyPool.Count(), b.proxyPool.HealthyCount())
+	var proxyStatus string
+	if b.proxyPool.IsRotating() {
+		proxyStatus = fmt.Sprintf("Proxies: rotating (%d active connections)",
+			b.proxyPool.Count())
+	} else {
+		proxyStatus = fmt.Sprintf("Proxies: %d total, %d healthy",
+			b.proxyPool.Count(), b.proxyPool.HealthyCount())
+	}
 
 	// Specific network detail
 	if len(args) > 0 {

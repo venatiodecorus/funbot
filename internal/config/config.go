@@ -75,25 +75,64 @@ func (n Network) FloodDelay() time.Duration {
 	return time.Duration(n.FloodDelayMs) * time.Millisecond
 }
 
-// ProxyConfig holds proxy API configuration.
+// ProxySource identifies the proxy sourcing method.
+type ProxySource string
+
+const (
+	// ProxySourceAPI sources proxies from a local proxy-scanner API.
+	ProxySourceAPI ProxySource = "api"
+	// ProxySourceRotating uses a single rotating SOCKS5 proxy endpoint
+	// (e.g. ProxyCheap) that returns a different exit IP on each connection.
+	ProxySourceRotating ProxySource = "rotating"
+)
+
+// ProxyConfig holds proxy configuration.
 type ProxyConfig struct {
+	// Source selects the proxy sourcing method: "api" (default) or "rotating".
+	// "api" fetches proxies from a local proxy-scanner API.
+	// "rotating" uses a single SOCKS5 rotating proxy endpoint.
+	Source ProxySource `mapstructure:"source"`
+
+	// --- API source fields ---
+
 	// APIURL is the base URL of the proxy-scanner API (e.g. "http://localhost:8080").
+	// Only used when Source is "api".
 	APIURL string `mapstructure:"api_url"`
 	// Protocol filters which proxy protocol to request (e.g. "socks5", "socks4").
+	// Only used when Source is "api".
 	Protocol string `mapstructure:"protocol"`
 	// MaxLatency filters proxies by maximum latency in milliseconds.
+	// Only used when Source is "api".
 	MaxLatency int `mapstructure:"max_latency"`
 	// RefreshInterval is how often to re-fetch proxies from the API.
+	// Only used when Source is "api".
 	RefreshInterval string `mapstructure:"refresh_interval"`
-	// MaxRetries is the number of consecutive connection failures before a proxy
-	// is purged from the pool entirely. 0 means purge on first failure (legacy
-	// behavior). Default is 3.
-	MaxRetries int `mapstructure:"max_retries"`
 	// MinPoolSize is the minimum number of healthy proxies to maintain in the
 	// pool. When the healthy count drops below this threshold, the pool
 	// automatically fetches more from the API during the background refresh
 	// cycle. 0 means no minimum (on-demand fetching only).
+	// Only used when Source is "api".
 	MinPoolSize int `mapstructure:"min_pool_size"`
+
+	// --- Rotating proxy fields ---
+
+	// RotatingAddr is the SOCKS5 address (host:port) of the rotating proxy.
+	// Only used when Source is "rotating".
+	RotatingAddr string `mapstructure:"rotating_addr"`
+	// RotatingUser is the authentication username for the rotating proxy.
+	// Only used when Source is "rotating".
+	RotatingUser string `mapstructure:"rotating_user"`
+	// RotatingPass is the authentication password for the rotating proxy.
+	// Only used when Source is "rotating".
+	RotatingPass string `mapstructure:"rotating_pass"`
+
+	// --- Shared fields ---
+
+	// MaxRetries is the number of consecutive connection failures before a proxy
+	// is purged from the pool (API source) or before the client gives up
+	// retrying the current connection cycle (rotating source).
+	// 0 means purge on first failure (legacy behavior). Default is 3.
+	MaxRetries int `mapstructure:"max_retries"`
 }
 
 // ArtConfig holds ASCII art repository configuration.

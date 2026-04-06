@@ -512,3 +512,221 @@ func TestRefillIfNeeded_Disabled(t *testing.T) {
 		t.Errorf("expected no API fetches when min_pool_size=0, got %d", fetchCount)
 	}
 }
+
+// --- Rotating proxy tests ---
+
+func TestRotatingPoolAcquire(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "testuser", "testpass")
+
+	if !pool.IsRotating() {
+		t.Fatal("expected pool to be rotating")
+	}
+	if pool.Source() != SourceRotating {
+		t.Errorf("expected source %q, got %q", SourceRotating, pool.Source())
+	}
+
+	// Acquire should always succeed
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy from rotating pool")
+	}
+	if p1.Host != "gate.proxycheap.com" {
+		t.Errorf("expected host gate.proxycheap.com, got %s", p1.Host)
+	}
+	if p1.Port != "10000" {
+		t.Errorf("expected port 10000, got %s", p1.Port)
+	}
+	if p1.User != "testuser" {
+		t.Errorf("expected user testuser, got %s", p1.User)
+	}
+	if p1.Pass != "testpass" {
+		t.Errorf("expected pass testpass, got %s", p1.Pass)
+	}
+	if !p1.Rotating {
+		t.Error("expected proxy to be marked as rotating")
+	}
+	if !p1.Networks["efnet"] {
+		t.Error("expected proxy to be assigned to efnet")
+	}
+	if pool.Count() != 1 {
+		t.Errorf("expected 1 active connection, got %d", pool.Count())
+	}
+}
+
+func TestRotatingPoolMultipleAcquire(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	// Acquiring multiple proxies for the same network should work (each is
+	// a separate connection through the rotating endpoint).
+	p1 := pool.AcquireForNetwork("efnet")
+	p2 := pool.AcquireForNetwork("efnet")
+	p3 := pool.AcquireForNetwork("efnet")
+
+	if p1 == nil || p2 == nil || p3 == nil {
+		t.Fatal("expected all acquires to succeed")
+	}
+
+	// Each should be a distinct Proxy instance even though they share the address
+	if p1 == p2 || p2 == p3 || p1 == p3 {
+		t.Error("expected distinct Proxy instances for each acquire")
+	}
+
+	// All should have the same address
+	if p1.ProxyAddress() != p2.ProxyAddress() || p2.ProxyAddress() != p3.ProxyAddress() {
+		t.Error("expected all proxies to share the rotating endpoint address")
+	}
+
+	if pool.Count() != 3 {
+		t.Errorf("expected 3 active connections, got %d", pool.Count())
+	}
+}
+
+func TestRotatingPoolRelease(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy")
+	}
+	if pool.Count() != 1 {
+		t.Errorf("expected 1 active connection, got %d", pool.Count())
+	}
+
+	// Releasing a rotating proxy should always remove it from the pool
+	pool.ReleaseFromNetwork(p1, "efnet", false)
+	if pool.Count() != 0 {
+		t.Errorf("expected 0 active connections after release, got %d", pool.Count())
+	}
+}
+
+func TestRotatingPoolReleaseByAddress(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	p1 := pool.AcquireForNetwork("efnet")
+	p2 := pool.AcquireForNetwork("undernet")
+	if p1 == nil || p2 == nil {
+		t.Fatal("expected proxies")
+	}
+	if pool.Count() != 2 {
+		t.Errorf("expected 2 active connections, got %d", pool.Count())
+	}
+
+	// Release the efnet one by address -- should only remove one entry
+	pool.ReleaseByAddressFromNetwork(p1.ProxyAddress(), "efnet", false)
+	if pool.Count() != 1 {
+		t.Errorf("expected 1 active connection after releasing efnet, got %d", pool.Count())
+	}
+
+	// The remaining one should be the undernet proxy
+	remaining := pool.All()
+	if len(remaining) != 1 || !remaining[0].Networks["undernet"] {
+		t.Error("expected remaining proxy to be the undernet connection")
+	}
+}
+
+func TestRotatingPoolReleaseByAddressFailed(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy")
+	}
+
+	// Even a failed release should remove the entry for rotating proxies
+	pool.ReleaseByAddressFromNetwork(p1.ProxyAddress(), "efnet", true)
+	if pool.Count() != 0 {
+		t.Errorf("expected 0 active connections after failed release, got %d", pool.Count())
+	}
+}
+
+func TestRotatingPoolAvailableForNetwork(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	// Rotating pools report large availability
+	avail := pool.AvailableForNetwork("efnet")
+	if avail < 100 {
+		t.Errorf("expected large availability for rotating pool, got %d", avail)
+	}
+}
+
+func TestRotatingPoolEnsureAvailable(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	// Should always succeed without API calls
+	avail, err := pool.EnsureAvailable(context.Background(), "efnet", 10)
+	if err != nil {
+		t.Fatalf("EnsureAvailable error: %v", err)
+	}
+	if avail < 10 {
+		t.Errorf("expected at least 10 available, got %d", avail)
+	}
+}
+
+func TestRotatingPoolFetchFromAPINoOp(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+
+	// FetchFromAPI should be a no-op for rotating pools
+	err := pool.FetchFromAPI(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error from FetchFromAPI on rotating pool, got %v", err)
+	}
+}
+
+func TestRotatingPoolRefillIfNeededNoOp(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetMinPoolSize(100) // even with a min pool size set
+
+	err := pool.RefillIfNeeded(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error from RefillIfNeeded on rotating pool, got %v", err)
+	}
+}
+
+func TestRotatingProxyString(t *testing.T) {
+	px := &Proxy{
+		Host:     "gate.proxycheap.com",
+		Port:     "10000",
+		User:     "testuser",
+		Pass:     "testpass",
+		Healthy:  true,
+		Rotating: true,
+		UseCount: 1,
+		Networks: map[string]bool{"efnet": true},
+	}
+	s := px.String()
+	expected := "socks5://testuser@gate.proxycheap.com:10000 (healthy, used 1 times, 1 networks rotating)"
+	if s != expected {
+		t.Errorf("unexpected string: %q, want %q", s, expected)
+	}
+}
+
+func TestRotatingPoolNoAddr(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetSource(SourceRotating)
+	// No address configured
+
+	p := pool.AcquireForNetwork("efnet")
+	if p != nil {
+		t.Error("expected nil when rotating address is not configured")
+	}
+}
+
+func TestSetSourcePreservesAPIBehavior(t *testing.T) {
+	pool := NewPool(slog.Default())
+	// Default should be API source
+	if pool.Source() != SourceAPI {
+		t.Errorf("expected default source %q, got %q", SourceAPI, pool.Source())
+	}
+	if pool.IsRotating() {
+		t.Error("expected pool not to be rotating by default")
+	}
+}

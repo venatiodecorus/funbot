@@ -155,6 +155,8 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 			Logger:     nm.log,
 			FloodDelay: nm.netCfg.FloodDelay(),
 			ProxyAddr:  px.ProxyAddress(),
+			ProxyUser:  px.User,
+			ProxyPass:  px.Pass,
 		}
 
 		client := irc.New(cfg)
@@ -232,7 +234,7 @@ func (nm *NetworkManager) runClientWithProxyRotation(client *irc.Client, clientI
 		}
 
 		currentProxy = newPx.ProxyAddress()
-		client.SetProxy(currentProxy, "", "")
+		client.SetProxy(currentProxy, newPx.User, newPx.Pass)
 		nm.log.Info("rotated to new proxy",
 			"client_id", clientID, "proxy", currentProxy)
 	}
