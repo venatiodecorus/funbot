@@ -115,6 +115,13 @@ funbot/
 │   │   ├── repo.go              # Git clone/pull management
 │   │   ├── catalog.go           # Art file indexing & search
 │   │   └── player.go            # Multi-client coordinated playback
+│   ├── nick/
+│   │   ├── nick.go              # Generator interface, factory, deduplicator
+│   │   ├── prefix.go            # Prefix+index strategy (legacy behavior)
+│   │   ├── random.go            # Random alphanumeric strategy
+│   │   ├── wordlist.go          # Adjective+noun wordlist strategy
+│   │   ├── adjectives.txt       # Embedded default adjective wordlist
+│   │   └── nouns.txt            # Embedded default noun wordlist
 │   ├── proxy/
 │   │   └── proxy.go             # Proxy list loading & assignment
 │   ├── redis/
@@ -168,7 +175,10 @@ networks:
     servers:
       - "irc.home.net:6697"
     ssl: true
-    nick_prefix: "funbot"
+    nick_prefix: "funbot"         # Legacy field, used if nick block is absent
+    nick:                          # Nick generation config
+      strategy: "prefix"          # "prefix", "random", or "wordlist"
+      prefix: "funbot"
     max_clients_per_ip: 3
     channels:
       - "#control"
@@ -178,7 +188,9 @@ networks:
     servers:
       - "irc.efnet.org:6667"
     ssl: false
-    nick_prefix: "fun"
+    nick:
+      strategy: "wordlist"        # Generate random nicks from adjective+noun combos
+      length: 12                  # Max nick length
     max_clients_per_ip: 5
     channels: []
     flood_delay_ms: 1000
@@ -224,7 +236,7 @@ Commands are issued via IRC PM to the controller bot on the home network. The co
 |---------|--------|-------------|
 | `!status` | `!status [network]` | Show summary of all networks, or detail for one |
 | `!networks` | `!networks` | List all connected networks and client counts |
-| `!connect` | `!connect <network> <server:port> [ssl]` | Add a new network at runtime |
+| `!connect` | `!connect <network> <server:port> [nick_prefix\|nicks:<strategy>] [count] [ssl]` | Add a new network at runtime |
 | `!disconnect` | `!disconnect <network>` | Disconnect all clients from a network |
 | `!join` | `!join [network] <#channel> [count]` | Join count clients to a channel (default: 1) |
 | `!part` | `!part [network] <#channel> [count\|all]` | Part clients from a channel |
@@ -280,7 +292,29 @@ When a command specifies `count` clients:
 - Listens for `QUIT` events on the network -- if the user holding the desired nick quits, immediately attempt the nick change
 - Stops when nick is acquired or cancelled
 
-### 6.6 Proxy Support
+### 6.6 Nick Generation
+
+`internal/nick/` package provides pluggable nick generation strategies:
+
+| Strategy | Config Value | Description | Example Output |
+|----------|-------------|-------------|----------------|
+| Prefix | `prefix` | Legacy behavior: `prefix + index` | `fun0`, `fun1`, `fun2` |
+| Random | `random` | Random alphanumeric string, optional prefix | `xK7mQ`, `preAb3rQ` |
+| Wordlist | `wordlist` | Random adjective+noun combos from a wordlist | `SwiftFox`, `quiet_storm73` |
+
+**Wordlist style variation**: The wordlist strategy randomly selects a formatting style per nick:
+- TitleCase: `SwiftFox`
+- TitleCase + digits: `SwiftFox42`
+- lowercase: `swiftfox`
+- lowercase + digits: `swiftfox73`
+- lower_snake: `swift_fox`
+- lower_snake + digits: `swift_fox9`
+
+**Config**: Per-network `nick` block with `strategy`, `prefix`, `length`, `wordlist_path` fields. Falls back to legacy `nick_prefix` field if `nick` block is absent.
+
+**Runtime**: `!connect` supports `nicks:<strategy>` argument (e.g., `!connect efnet irc.efnet.org:6667 nicks:wordlist 5`).
+
+### 6.7 Proxy Support
 
 `internal/proxy/proxy.go`:
 - Loads proxy list from file (SOCKS5 format: `socks5://host:port` or `socks5://user:pass@host:port`)
@@ -290,7 +324,7 @@ When a command specifies `count` clients:
 - Each proxy assumed to provide one additional IP, so one additional connection slot
 - Proxy health checking: if a connection through a proxy fails, mark it unhealthy and rotate
 
-### 6.7 Scaling
+### 6.8 Scaling
 
 `internal/controller/scaler.go`:
 - Uses `client-go` to interact with the Kubernetes API
@@ -303,7 +337,7 @@ When a command specifies `count` clients:
   6. Wait for pods ready, then re-execute the original command
 - When running locally (docker-compose), scaling is not available; the bot reports the limitation
 
-### 6.8 Status Reporting
+### 6.9 Status Reporting
 
 Workers publish heartbeats to Redis every 10 seconds:
 
@@ -411,6 +445,7 @@ The controller's ServiceAccount needs:
 - [x] Multi-client channel messaging (`!say`)
 - [x] Proxy support (loading, assignment, health checking)
 - [x] `!raw` command
+- [x] Random nick generation (`internal/nick/` package — prefix, random, wordlist strategies)
 - **Milestone**: Full IRC command set working across networks with proxy support
 
 ### Phase 4: ASCII Art

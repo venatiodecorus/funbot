@@ -10,6 +10,23 @@ import (
 	"github.com/spf13/viper"
 )
 
+// NickStrategy identifies a nick generation strategy.
+type NickStrategy string
+
+const (
+	NickStrategyPrefix   NickStrategy = "prefix"
+	NickStrategyRandom   NickStrategy = "random"
+	NickStrategyWordlist NickStrategy = "wordlist"
+)
+
+// NickConfig holds nick generation settings for a network.
+type NickConfig struct {
+	Strategy     NickStrategy `mapstructure:"strategy"`
+	Prefix       string       `mapstructure:"prefix"`
+	Length       int          `mapstructure:"length"`
+	WordlistPath string       `mapstructure:"wordlist_path"`
+}
+
 // Config is the top-level configuration for Funbot.
 type Config struct {
 	HomeNetwork   string             `mapstructure:"home_network"`
@@ -29,12 +46,28 @@ type AuthConfig struct {
 
 // Network holds configuration for a single IRC network.
 type Network struct {
-	Servers        []string `mapstructure:"servers"`
-	SSL            bool     `mapstructure:"ssl"`
-	NickPrefix     string   `mapstructure:"nick_prefix"`
-	Channels       []string `mapstructure:"channels"`
-	FloodDelayMs   int      `mapstructure:"flood_delay_ms"`
-	DefaultClients int      `mapstructure:"default_clients"`
+	Servers        []string   `mapstructure:"servers"`
+	SSL            bool       `mapstructure:"ssl"`
+	NickPrefix     string     `mapstructure:"nick_prefix"` // Legacy: used as fallback if Nick is not set
+	Nick           NickConfig `mapstructure:"nick"`        // Nick generation config
+	Channels       []string   `mapstructure:"channels"`
+	FloodDelayMs   int        `mapstructure:"flood_delay_ms"`
+	DefaultClients int        `mapstructure:"default_clients"`
+}
+
+// EffectiveNickConfig returns the nick generation config, applying backward
+// compatibility with the legacy nick_prefix field. If the Nick block is not
+// configured, it falls back to using NickPrefix with the "prefix" strategy.
+func (n Network) EffectiveNickConfig() NickConfig {
+	// If the new Nick config has an explicit strategy, use it.
+	if n.Nick.Strategy != "" {
+		return n.Nick
+	}
+	// Fall back to legacy nick_prefix field.
+	return NickConfig{
+		Strategy: NickStrategyPrefix,
+		Prefix:   n.NickPrefix,
+	}
 }
 
 // FloodDelay returns the flood delay as a time.Duration.
@@ -143,8 +176,24 @@ func (c *Config) Validate() error {
 		if len(net.Servers) == 0 {
 			return fmt.Errorf("network %q has no servers configured", name)
 		}
-		if net.NickPrefix == "" {
-			return fmt.Errorf("network %q has no nick_prefix configured", name)
+		// Validate nick config. Either the new nick block or legacy nick_prefix must be set.
+		nickCfg := net.EffectiveNickConfig()
+		switch nickCfg.Strategy {
+		case NickStrategyPrefix:
+			if nickCfg.Prefix == "" && net.NickPrefix == "" {
+				return fmt.Errorf("network %q: prefix nick strategy requires a non-empty prefix (set nick.prefix or nick_prefix)", name)
+			}
+		case NickStrategyRandom:
+			// Random strategy works with or without a prefix.
+		case NickStrategyWordlist:
+			// Wordlist strategy works with or without a prefix.
+		case "":
+			// No strategy set and no legacy nick_prefix — error.
+			if net.NickPrefix == "" {
+				return fmt.Errorf("network %q has no nick configuration (set nick.strategy or nick_prefix)", name)
+			}
+		default:
+			return fmt.Errorf("network %q: unknown nick strategy %q", name, nickCfg.Strategy)
 		}
 	}
 

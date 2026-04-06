@@ -174,7 +174,11 @@ func (b *Bot) Run(ctx context.Context) error {
 		if netCfg.DefaultClients <= 0 {
 			continue
 		}
-		nm := NewNetworkManager(name, netCfg, b.proxyPool, b.log)
+		nm, err := NewNetworkManager(name, netCfg, b.proxyPool, b.log)
+		if err != nil {
+			b.log.Warn("failed to create network manager", "network", name, "error", err)
+			continue
+		}
 		if err := nm.Start(ctx); err != nil {
 			b.log.Warn("failed to start network", "network", name, "error", err)
 			continue
@@ -891,10 +895,11 @@ func (b *Bot) handleArtSearch(args []string) string {
 	return strings.Join(lines, "\n")
 }
 
-// handleConnect implements !connect <network> <server:port> [nick_prefix] [count] [ssl].
+// handleConnect implements !connect <network> <server:port> [nick_prefix|nicks:strategy] [count] [ssl].
+// Nick strategy can be specified as "nicks:random", "nicks:wordlist", or a plain string for prefix strategy.
 func (b *Bot) handleConnect(args []string) string {
 	if len(args) < 2 {
-		return "Usage: !connect <network> <server:port> [nick_prefix] [count] [ssl]"
+		return "Usage: !connect <network> <server:port> [nick_prefix|nicks:<strategy>] [count] [ssl]"
 	}
 
 	network := args[0]
@@ -906,12 +911,25 @@ func (b *Bot) handleConnect(args []string) string {
 	}
 
 	nickPrefix := "fun"
+	nickStrategy := config.NickStrategyPrefix
 	count := 1
 	ssl := false
 
 	for _, arg := range args[2:] {
 		if arg == "ssl" {
 			ssl = true
+		} else if strings.HasPrefix(arg, "nicks:") {
+			strategy := strings.TrimPrefix(arg, "nicks:")
+			switch config.NickStrategy(strategy) {
+			case config.NickStrategyRandom:
+				nickStrategy = config.NickStrategyRandom
+			case config.NickStrategyWordlist:
+				nickStrategy = config.NickStrategyWordlist
+			case config.NickStrategyPrefix:
+				nickStrategy = config.NickStrategyPrefix
+			default:
+				return fmt.Sprintf("Unknown nick strategy %q. Use: prefix, random, wordlist", strategy)
+			}
 		} else if n, err := strconv.Atoi(arg); err == nil {
 			count = n
 		} else {
@@ -926,9 +944,13 @@ func (b *Bot) handleConnect(args []string) string {
 	}
 
 	netCfg := config.Network{
-		Servers:        []string{fmt.Sprintf("%s:%d", server, port)},
-		SSL:            ssl,
-		NickPrefix:     nickPrefix,
+		Servers:    []string{fmt.Sprintf("%s:%d", server, port)},
+		SSL:        ssl,
+		NickPrefix: nickPrefix,
+		Nick: config.NickConfig{
+			Strategy: nickStrategy,
+			Prefix:   nickPrefix,
+		},
 		Channels:       []string{},
 		FloodDelayMs:   1000,
 		DefaultClients: count,
@@ -937,7 +959,11 @@ func (b *Bot) handleConnect(args []string) string {
 	// Add to runtime config
 	b.cfg.Networks[network] = netCfg
 
-	nm := NewNetworkManager(network, netCfg, b.proxyPool, b.log)
+	nm, err := NewNetworkManager(network, netCfg, b.proxyPool, b.log)
+	if err != nil {
+		delete(b.cfg.Networks, network)
+		return fmt.Sprintf("Failed to create network manager for %s: %v", network, err)
+	}
 	if err := nm.Start(context.Background()); err != nil {
 		delete(b.cfg.Networks, network)
 		return fmt.Sprintf("Failed to connect to %s: %v", network, err)

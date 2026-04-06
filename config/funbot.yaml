@@ -10,7 +10,12 @@ networks:
     servers:
       - "irc.home.net:6697"
     ssl: true
-    nick_prefix: "funbot"
+    nick_prefix: "funbot"       # Legacy: used if nick block is absent
+    nick:                        # Nick generation config (overrides nick_prefix)
+      strategy: "prefix"        # "prefix", "random", or "wordlist"
+      prefix: "funbot"          # Prefix for prefix/random strategies, optional for wordlist
+      length: 9                 # Max nick length (for random/wordlist strategies)
+      # wordlist_path: ""       # Custom wordlist file; empty = use built-in default
     channels:
       - "#control"
     flood_delay_ms: 500

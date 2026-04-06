@@ -11,6 +11,7 @@ import (
 
 	"github.com/venatiodecorus/funbot/internal/config"
 	"github.com/venatiodecorus/funbot/internal/irc"
+	"github.com/venatiodecorus/funbot/internal/nick"
 	"github.com/venatiodecorus/funbot/internal/proxy"
 )
 
@@ -36,6 +37,7 @@ type NetworkManager struct {
 	netCfg     config.Network
 	proxyPool  *proxy.Pool
 	floodGuard *irc.GlobalFloodGuard
+	nickGen    nick.Generator
 	clients    []*irc.Client
 	keepNicks  map[string]*irc.KeepNick // client ID -> keepnick manager
 	ctx        context.Context
@@ -44,7 +46,7 @@ type NetworkManager struct {
 }
 
 // NewNetworkManager creates a new network manager for the given network.
-func NewNetworkManager(network string, netCfg config.Network, proxyPool *proxy.Pool, log *slog.Logger) *NetworkManager {
+func NewNetworkManager(network string, netCfg config.Network, proxyPool *proxy.Pool, log *slog.Logger) (*NetworkManager, error) {
 	nmLog := log.With("component", "network", "network", network)
 
 	// Create a global flood guard for this network.
@@ -58,14 +60,27 @@ func NewNetworkManager(network string, netCfg config.Network, proxyPool *proxy.P
 	}
 	floodGuard := irc.NewGlobalFloodGuard(10, guardRefill, nmLog)
 
+	// Create nick generator from network config.
+	nickCfg := netCfg.EffectiveNickConfig()
+	nickGen, err := nick.NewGenerator(nick.Config{
+		Strategy:     nick.Strategy(nickCfg.Strategy),
+		Prefix:       nickCfg.Prefix,
+		Length:       nickCfg.Length,
+		WordlistPath: nickCfg.WordlistPath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating nick generator for network %s: %w", network, err)
+	}
+
 	return &NetworkManager{
 		network:    network,
 		netCfg:     netCfg,
 		proxyPool:  proxyPool,
 		floodGuard: floodGuard,
+		nickGen:    nickGen,
 		keepNicks:  make(map[string]*irc.KeepNick),
 		log:        nmLog,
-	}
+	}, nil
 }
 
 // Start initializes the network manager and connects the default number of clients.
@@ -126,7 +141,7 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 		nm.mu.Unlock()
 
 		clientID := fmt.Sprintf("%s-%d", nm.network, clientIndex)
-		nick := fmt.Sprintf("%s%d", nm.netCfg.NickPrefix, clientIndex)
+		nick := nm.nickGen.Generate(clientIndex)
 
 		cfg := irc.ClientConfig{
 			ID:         clientID,
