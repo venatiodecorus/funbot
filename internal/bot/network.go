@@ -204,7 +204,10 @@ func (nm *NetworkManager) runClientWithProxyRotation(client *irc.Client, clientI
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		nm.proxyPool.EnsureAvailable(ctx, nm.network, 1)
+		if _, err := nm.proxyPool.EnsureAvailable(ctx, nm.network, 1); err != nil {
+			nm.log.Warn("failed to fetch proxies for rotation",
+				"client_id", clientID, "error", err)
+		}
 
 		newPx := nm.proxyPool.AcquireForNetwork(nm.network)
 		if newPx == nil {
