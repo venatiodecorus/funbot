@@ -84,9 +84,9 @@ func New(cfg *config.Config, log *slog.Logger) (*Bot, error) {
 
 	switch cfg.Proxies.Source {
 	case config.ProxySourceRotating:
-		proxyPool.SetRotatingProxy(cfg.Proxies.RotatingAddr, cfg.Proxies.RotatingUser, cfg.Proxies.RotatingPass)
+		proxyPool.SetRotatingProxy(cfg.Proxies.RotatingProto, cfg.Proxies.RotatingAddr, cfg.Proxies.RotatingUser, cfg.Proxies.RotatingPass)
 		log.Info("proxy pool configured with rotating proxy",
-			"addr", cfg.Proxies.RotatingAddr)
+			"proto", cfg.Proxies.RotatingProto, "addr", cfg.Proxies.RotatingAddr)
 	default:
 		// "api" or empty (backwards compatible default)
 		if cfg.Proxies.APIURL != "" {

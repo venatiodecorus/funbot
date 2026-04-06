@@ -81,7 +81,7 @@ type ProxySource string
 const (
 	// ProxySourceAPI sources proxies from a local proxy-scanner API.
 	ProxySourceAPI ProxySource = "api"
-	// ProxySourceRotating uses a single rotating SOCKS5 proxy endpoint
+	// ProxySourceRotating uses a single rotating proxy endpoint (SOCKS5 or HTTP)
 	// (e.g. ProxyCheap) that returns a different exit IP on each connection.
 	ProxySourceRotating ProxySource = "rotating"
 )
@@ -116,7 +116,11 @@ type ProxyConfig struct {
 
 	// --- Rotating proxy fields ---
 
-	// RotatingAddr is the SOCKS5 address (host:port) of the rotating proxy.
+	// RotatingProto is the proxy protocol for the rotating endpoint: "socks5"
+	// (default) or "http". HTTP uses the CONNECT method to tunnel TCP.
+	// Only used when Source is "rotating".
+	RotatingProto string `mapstructure:"rotating_proto"`
+	// RotatingAddr is the address (host:port) of the rotating proxy.
 	// Only used when Source is "rotating".
 	RotatingAddr string `mapstructure:"rotating_addr"`
 	// RotatingUser is the authentication username for the rotating proxy.

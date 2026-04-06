@@ -3,16 +3,26 @@
 package irc
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/lrstanley/girc"
 	"golang.org/x/net/proxy"
+)
+
+// ProxyProto identifies the proxy protocol to use.
+const (
+	ProxyProtoSOCKS5 = "socks5"
+	ProxyProtoHTTP   = "http"
 )
 
 // Reconnection defaults.
@@ -42,13 +52,14 @@ type Client struct {
 	flood   *FloodControl
 	log     *slog.Logger
 
-	mu        sync.RWMutex
-	connected bool
-	nick      string
-	channels  []string
-	proxyAddr string // SOCKS5 proxy used for this connection (empty if direct)
-	proxyUser string // SOCKS5 proxy username
-	proxyPass string // SOCKS5 proxy password
+	mu         sync.RWMutex
+	connected  bool
+	nick       string
+	channels   []string
+	proxyProto string // proxy protocol: "socks5" (default) or "http"
+	proxyAddr  string // proxy address (host:port), empty if direct
+	proxyUser  string // proxy username
+	proxyPass  string // proxy password
 
 	onPrivmsg    MessageHandler
 	onConnect    ConnectHandler
@@ -67,9 +78,10 @@ type ClientConfig struct {
 	Realname   string
 	Logger     *slog.Logger
 	FloodDelay time.Duration // Minimum delay between messages (0 = no limit)
-	ProxyAddr  string        // SOCKS5 proxy address (host:port), empty for direct
-	ProxyUser  string        // SOCKS5 proxy username (optional)
-	ProxyPass  string        // SOCKS5 proxy password (optional)
+	ProxyProto string        // Proxy protocol: "socks5" (default) or "http"
+	ProxyAddr  string        // Proxy address (host:port), empty for direct
+	ProxyUser  string        // Proxy username (optional)
+	ProxyPass  string        // Proxy password (optional)
 }
 
 // New creates a new IRC client with the given configuration.
@@ -103,16 +115,17 @@ func New(cfg ClientConfig) *Client {
 	}
 
 	c := &Client{
-		id:        cfg.ID,
-		network:   cfg.Network,
-		gircCli:   gircCli,
-		cfg:       cfg,
-		flood:     flood,
-		log:       log,
-		nick:      cfg.Nick,
-		proxyAddr: cfg.ProxyAddr,
-		proxyUser: cfg.ProxyUser,
-		proxyPass: cfg.ProxyPass,
+		id:         cfg.ID,
+		network:    cfg.Network,
+		gircCli:    gircCli,
+		cfg:        cfg,
+		flood:      flood,
+		log:        log,
+		nick:       cfg.Nick,
+		proxyProto: cfg.ProxyProto,
+		proxyAddr:  cfg.ProxyAddr,
+		proxyUser:  cfg.ProxyUser,
+		proxyPass:  cfg.ProxyPass,
 	}
 
 	// Register handlers
@@ -163,9 +176,9 @@ func New(cfg ClientConfig) *Client {
 
 // Connect establishes the IRC connection. It blocks until the connection
 // is closed or the context is cancelled. If a proxy is configured, the
-// connection will be routed through the SOCKS5 proxy.
+// connection will be routed through the proxy (SOCKS5 or HTTP CONNECT).
 func (c *Client) Connect(ctx context.Context) error {
-	c.log.Info("connecting to IRC", "proxy", c.proxyAddr)
+	c.log.Info("connecting to IRC", "proxy_proto", c.proxyProto, "proxy", c.proxyAddr)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -315,23 +328,98 @@ func (c *Client) resetGircClient() {
 	c.mu.Unlock()
 }
 
-// createProxyDialer creates a SOCKS5 proxy dialer from the client config.
+// createProxyDialer creates a proxy dialer based on the configured protocol.
+// Supports SOCKS5 (default) and HTTP CONNECT proxies.
 func (c *Client) createProxyDialer() (proxy.Dialer, error) {
-	var auth *proxy.Auth
-	if c.proxyUser != "" {
-		auth = &proxy.Auth{
-			User:     c.proxyUser,
-			Password: c.proxyPass,
+	switch c.proxyProto {
+	case ProxyProtoHTTP:
+		return &httpConnectDialer{
+			proxyAddr: c.proxyAddr,
+			user:      c.proxyUser,
+			pass:      c.proxyPass,
+			timeout:   30 * time.Second,
+		}, nil
+	default:
+		// SOCKS5 (default)
+		var auth *proxy.Auth
+		if c.proxyUser != "" {
+			auth = &proxy.Auth{
+				User:     c.proxyUser,
+				Password: c.proxyPass,
+			}
 		}
+		dialer, err := proxy.SOCKS5("tcp", c.proxyAddr, auth, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("creating SOCKS5 dialer for %s: %w", c.proxyAddr, err)
+		}
+		return dialer, nil
 	}
-	dialer, err := proxy.SOCKS5("tcp", c.proxyAddr, auth, proxy.Direct)
-	if err != nil {
-		return nil, fmt.Errorf("creating SOCKS5 dialer for %s: %w", c.proxyAddr, err)
-	}
-	return dialer, nil
 }
 
-// ProxyAddr returns the SOCKS5 proxy address used for this connection,
+// httpConnectDialer implements proxy.Dialer using the HTTP CONNECT method.
+// This tunnels a raw TCP connection through an HTTP proxy, allowing
+// non-HTTP protocols (like IRC) to pass through.
+type httpConnectDialer struct {
+	proxyAddr string
+	user      string
+	pass      string
+	timeout   time.Duration
+}
+
+// Dial connects to the proxy and issues an HTTP CONNECT request to tunnel
+// to the target address. The returned net.Conn is the raw tunneled connection.
+func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", d.proxyAddr, d.timeout)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to HTTP proxy %s: %w", d.proxyAddr, err)
+	}
+
+	// Build the CONNECT request
+	req, err := http.NewRequest(http.MethodConnect, "http://"+addr, nil)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("building CONNECT request: %w", err)
+	}
+	req.Host = addr
+
+	if d.user != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(d.user + ":" + d.pass))
+		req.Header.Set("Proxy-Authorization", "Basic "+creds)
+	}
+
+	// Set a deadline for the CONNECT handshake
+	if err := conn.SetDeadline(time.Now().Add(d.timeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("setting deadline: %w", err)
+	}
+
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("sending CONNECT to %s: %w", d.proxyAddr, err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("reading CONNECT response from %s: %w", d.proxyAddr, err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP CONNECT to %s via %s failed: %s", addr, d.proxyAddr, resp.Status)
+	}
+
+	// Clear the deadline — the tunnel is now established
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("clearing deadline: %w", err)
+	}
+
+	return conn, nil
+}
+
+// ProxyAddr returns the proxy address used for this connection,
 // or an empty string if using a direct connection.
 func (c *Client) ProxyAddr() string {
 	c.mu.RLock()
@@ -339,19 +427,21 @@ func (c *Client) ProxyAddr() string {
 	return c.proxyAddr
 }
 
-// SetProxy updates the SOCKS5 proxy address (and optional credentials) used
-// for future connection attempts. This should be called between retry cycles
-// when rotating to a new proxy.
-func (c *Client) SetProxy(addr, user, pass string) {
+// SetProxy updates the proxy address, protocol, and optional credentials
+// used for future connection attempts. This should be called between retry
+// cycles when rotating to a new proxy. Proto should be "socks5" or "http".
+func (c *Client) SetProxy(proto, addr, user, pass string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.proxyProto = proto
 	c.proxyAddr = addr
 	c.proxyUser = user
 	c.proxyPass = pass
+	c.cfg.ProxyProto = proto
 	c.cfg.ProxyAddr = addr
 	c.cfg.ProxyUser = user
 	c.cfg.ProxyPass = pass
-	c.log.Info("proxy updated", "proxy", addr)
+	c.log.Info("proxy updated", "proto", proto, "proxy", addr)
 }
 
 // Quit sends an IRC QUIT command with the given reason, then closes the

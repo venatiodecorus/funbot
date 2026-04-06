@@ -62,11 +62,13 @@ type apiResponse struct {
 }
 
 // Proxy represents a single SOCKS5 proxy.
+// Proxy represents a single proxy endpoint.
 type Proxy struct {
 	Host      string
 	Port      string
-	User      string // SOCKS5 auth username (empty for unauthenticated)
-	Pass      string // SOCKS5 auth password
+	Proto     string // proxy protocol: "socks5" (default) or "http"
+	User      string // auth username (empty for unauthenticated)
+	Pass      string // auth password
 	Healthy   bool
 	Rotating  bool            // true if this is a rotating proxy endpoint
 	Networks  map[string]bool // networks this proxy is currently connected to
@@ -92,9 +94,10 @@ type Pool struct {
 	client      *http.Client
 
 	// Rotating proxy fields
-	rotatingAddr string // SOCKS5 address (host:port) of the rotating proxy
-	rotatingUser string // authentication username
-	rotatingPass string // authentication password
+	rotatingProto string // proxy protocol: "socks5" or "http"
+	rotatingAddr  string // address (host:port) of the rotating proxy
+	rotatingUser  string // authentication username
+	rotatingPass  string // authentication password
 }
 
 // NewPool creates a new proxy pool. The default source is SourceAPI.
@@ -124,11 +127,15 @@ func (p *Pool) Source() SourceType {
 }
 
 // SetRotatingProxy configures the rotating proxy endpoint and credentials.
-// This also sets the source to SourceRotating.
-func (p *Pool) SetRotatingProxy(addr, user, pass string) {
+// Proto should be "socks5" or "http". This also sets the source to SourceRotating.
+func (p *Pool) SetRotatingProxy(proto, addr, user, pass string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.source = SourceRotating
+	if proto == "" {
+		proto = "socks5"
+	}
+	p.rotatingProto = proto
 	p.rotatingAddr = addr
 	p.rotatingUser = user
 	p.rotatingPass = pass
@@ -378,6 +385,7 @@ func (p *Pool) acquireRotatingLocked(network string) *Proxy {
 	px := &Proxy{
 		Host:     host,
 		Port:     port,
+		Proto:    p.rotatingProto,
 		User:     p.rotatingUser,
 		Pass:     p.rotatingPass,
 		Healthy:  true,

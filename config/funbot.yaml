@@ -32,7 +32,8 @@ proxies:
   min_pool_size: 0         # minimum healthy proxies to maintain (0 = on-demand only)
 
   # --- Rotating proxy settings (used when source: "rotating") ---
-  # A single SOCKS5 endpoint that assigns a different exit IP per connection.
+  # A single proxy endpoint that assigns a different exit IP per connection.
+  # rotating_proto: "socks5"               # "socks5" (default) or "http" (HTTP CONNECT tunnel)
   # rotating_addr: "gate.proxycheap.com:10000"
   # rotating_user: "your_username"
   # rotating_pass: "your_password"

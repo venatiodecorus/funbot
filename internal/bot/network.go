@@ -154,6 +154,7 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 			Realname:   "Funbot",
 			Logger:     nm.log,
 			FloodDelay: nm.netCfg.FloodDelay(),
+			ProxyProto: px.Proto,
 			ProxyAddr:  px.ProxyAddress(),
 			ProxyUser:  px.User,
 			ProxyPass:  px.Pass,
@@ -234,9 +235,9 @@ func (nm *NetworkManager) runClientWithProxyRotation(client *irc.Client, clientI
 		}
 
 		currentProxy = newPx.ProxyAddress()
-		client.SetProxy(currentProxy, newPx.User, newPx.Pass)
+		client.SetProxy(newPx.Proto, currentProxy, newPx.User, newPx.Pass)
 		nm.log.Info("rotated to new proxy",
-			"client_id", clientID, "proxy", currentProxy)
+			"client_id", clientID, "proto", newPx.Proto, "proxy", currentProxy)
 	}
 }
 

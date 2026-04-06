@@ -517,7 +517,7 @@ func TestRefillIfNeeded_Disabled(t *testing.T) {
 
 func TestRotatingPoolAcquire(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "testuser", "testpass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "testuser", "testpass")
 
 	if !pool.IsRotating() {
 		t.Fatal("expected pool to be rotating")
@@ -543,6 +543,9 @@ func TestRotatingPoolAcquire(t *testing.T) {
 	if p1.Pass != "testpass" {
 		t.Errorf("expected pass testpass, got %s", p1.Pass)
 	}
+	if p1.Proto != "socks5" {
+		t.Errorf("expected proto socks5, got %s", p1.Proto)
+	}
 	if !p1.Rotating {
 		t.Error("expected proxy to be marked as rotating")
 	}
@@ -556,7 +559,7 @@ func TestRotatingPoolAcquire(t *testing.T) {
 
 func TestRotatingPoolMultipleAcquire(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	// Acquiring multiple proxies for the same network should work (each is
 	// a separate connection through the rotating endpoint).
@@ -585,7 +588,7 @@ func TestRotatingPoolMultipleAcquire(t *testing.T) {
 
 func TestRotatingPoolRelease(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	p1 := pool.AcquireForNetwork("efnet")
 	if p1 == nil {
@@ -604,7 +607,7 @@ func TestRotatingPoolRelease(t *testing.T) {
 
 func TestRotatingPoolReleaseByAddress(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	p1 := pool.AcquireForNetwork("efnet")
 	p2 := pool.AcquireForNetwork("undernet")
@@ -630,7 +633,7 @@ func TestRotatingPoolReleaseByAddress(t *testing.T) {
 
 func TestRotatingPoolReleaseByAddressFailed(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	p1 := pool.AcquireForNetwork("efnet")
 	if p1 == nil {
@@ -646,7 +649,7 @@ func TestRotatingPoolReleaseByAddressFailed(t *testing.T) {
 
 func TestRotatingPoolAvailableForNetwork(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	// Rotating pools report large availability
 	avail := pool.AvailableForNetwork("efnet")
@@ -657,7 +660,7 @@ func TestRotatingPoolAvailableForNetwork(t *testing.T) {
 
 func TestRotatingPoolEnsureAvailable(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	// Should always succeed without API calls
 	avail, err := pool.EnsureAvailable(context.Background(), "efnet", 10)
@@ -671,7 +674,7 @@ func TestRotatingPoolEnsureAvailable(t *testing.T) {
 
 func TestRotatingPoolFetchFromAPINoOp(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 
 	// FetchFromAPI should be a no-op for rotating pools
 	err := pool.FetchFromAPI(context.Background())
@@ -682,7 +685,7 @@ func TestRotatingPoolFetchFromAPINoOp(t *testing.T) {
 
 func TestRotatingPoolRefillIfNeededNoOp(t *testing.T) {
 	pool := NewPool(slog.Default())
-	pool.SetRotatingProxy("gate.proxycheap.com:10000", "user", "pass")
+	pool.SetRotatingProxy("socks5", "gate.proxycheap.com:10000", "user", "pass")
 	pool.SetMinPoolSize(100) // even with a min pool size set
 
 	err := pool.RefillIfNeeded(context.Background())
@@ -728,5 +731,38 @@ func TestSetSourcePreservesAPIBehavior(t *testing.T) {
 	}
 	if pool.IsRotating() {
 		t.Error("expected pool not to be rotating by default")
+	}
+}
+
+func TestRotatingPoolHTTPProto(t *testing.T) {
+	pool := NewPool(slog.Default())
+	pool.SetRotatingProxy("http", "proxy-us.proxy-cheap.com:9595", "user", "pass")
+
+	px := pool.AcquireForNetwork("efnet")
+	if px == nil {
+		t.Fatal("expected a proxy")
+	}
+	if px.Proto != "http" {
+		t.Errorf("expected proto http, got %s", px.Proto)
+	}
+	if px.Host != "proxy-us.proxy-cheap.com" {
+		t.Errorf("expected host proxy-us.proxy-cheap.com, got %s", px.Host)
+	}
+	if px.Port != "9595" {
+		t.Errorf("expected port 9595, got %s", px.Port)
+	}
+}
+
+func TestRotatingPoolDefaultProto(t *testing.T) {
+	pool := NewPool(slog.Default())
+	// Empty proto should default to socks5
+	pool.SetRotatingProxy("", "gate.proxycheap.com:10000", "user", "pass")
+
+	px := pool.AcquireForNetwork("efnet")
+	if px == nil {
+		t.Fatal("expected a proxy")
+	}
+	if px.Proto != "socks5" {
+		t.Errorf("expected proto to default to socks5, got %s", px.Proto)
 	}
 }
