@@ -12,6 +12,4 @@ FROM gcr.io/distroless/static-debian12
 
 COPY --from=builder /funbot /funbot
 
-EXPOSE 8080
-
 ENTRYPOINT ["/funbot"]

@@ -1,4 +1,4 @@
-# Integration test environment: ergo IRC server + Redis
+# Integration test environment: ergo IRC server
 # Usage: docker compose -f test/integration/docker-compose.yaml up -d
 services:
   ircd:
@@ -9,16 +9,6 @@ services:
       - ./ergo.yaml:/ircd/ircd.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 6667 || exit 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 5s
       retries: 10

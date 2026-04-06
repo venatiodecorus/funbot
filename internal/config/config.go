@@ -12,20 +12,13 @@ import (
 
 // Config is the top-level configuration for Funbot.
 type Config struct {
-	Role       string             `mapstructure:"role"`
-	Controller ControllerConfig   `mapstructure:"controller"`
-	Redis      RedisConfig        `mapstructure:"redis"`
-	Networks   map[string]Network `mapstructure:"networks"`
-	Proxies    ProxyConfig        `mapstructure:"proxies"`
-	Art        ArtConfig          `mapstructure:"art"`
-	Logging    LoggingConfig      `mapstructure:"logging"`
-}
-
-// ControllerConfig holds settings specific to the controller role.
-type ControllerConfig struct {
-	HomeNetwork   string     `mapstructure:"home_network"`
-	Auth          AuthConfig `mapstructure:"auth"`
-	CommandPrefix string     `mapstructure:"command_prefix"`
+	HomeNetwork   string             `mapstructure:"home_network"`
+	Auth          AuthConfig         `mapstructure:"auth"`
+	CommandPrefix string             `mapstructure:"command_prefix"`
+	Networks      map[string]Network `mapstructure:"networks"`
+	Proxies       ProxyConfig        `mapstructure:"proxies"`
+	Art           ArtConfig          `mapstructure:"art"`
+	Logging       LoggingConfig      `mapstructure:"logging"`
 }
 
 // AuthConfig specifies the authorized user for issuing commands.
@@ -34,21 +27,14 @@ type AuthConfig struct {
 	Hostname string `mapstructure:"hostname"`
 }
 
-// RedisConfig holds Redis connection settings.
-type RedisConfig struct {
-	Address  string `mapstructure:"address"`
-	Password string `mapstructure:"password"`
-	DB       int    `mapstructure:"db"`
-}
-
 // Network holds configuration for a single IRC network.
 type Network struct {
-	Servers         []string `mapstructure:"servers"`
-	SSL             bool     `mapstructure:"ssl"`
-	NickPrefix      string   `mapstructure:"nick_prefix"`
-	MaxClientsPerIP int      `mapstructure:"max_clients_per_ip"`
-	Channels        []string `mapstructure:"channels"`
-	FloodDelayMs    int      `mapstructure:"flood_delay_ms"`
+	Servers        []string `mapstructure:"servers"`
+	SSL            bool     `mapstructure:"ssl"`
+	NickPrefix     string   `mapstructure:"nick_prefix"`
+	Channels       []string `mapstructure:"channels"`
+	FloodDelayMs   int      `mapstructure:"flood_delay_ms"`
+	DefaultClients int      `mapstructure:"default_clients"`
 }
 
 // FloodDelay returns the flood delay as a time.Duration.
@@ -81,11 +67,7 @@ func Load(configPath string) (*Config, error) {
 	v := viper.New()
 
 	// Defaults
-	v.SetDefault("role", "controller")
-	v.SetDefault("controller.command_prefix", "!")
-	v.SetDefault("redis.address", "localhost:6379")
-	v.SetDefault("redis.password", "")
-	v.SetDefault("redis.db", 0)
+	v.SetDefault("command_prefix", "!")
 	v.SetDefault("art.repo_url", "https://github.com/birdneststream/asciiart.git")
 	v.SetDefault("art.local_path", "/data/asciiart")
 	v.SetDefault("art.update_interval", "1h")
@@ -129,20 +111,16 @@ func Load(configPath string) (*Config, error) {
 
 // Validate checks that the configuration is consistent and usable.
 func (c *Config) Validate() error {
-	if c.Role != "controller" && c.Role != "worker" {
-		return fmt.Errorf("role must be 'controller' or 'worker', got %q", c.Role)
+	if c.HomeNetwork == "" {
+		return fmt.Errorf("home_network is required")
 	}
 
-	if c.Role == "controller" {
-		if c.Controller.HomeNetwork == "" {
-			return fmt.Errorf("controller.home_network is required for controller role")
-		}
-		if c.Controller.Auth.Nick == "" || c.Controller.Auth.Hostname == "" {
-			return fmt.Errorf("controller.auth.nick and controller.auth.hostname are required")
-		}
-		if _, ok := c.Networks[c.Controller.HomeNetwork]; !ok {
-			return fmt.Errorf("controller.home_network %q not found in networks", c.Controller.HomeNetwork)
-		}
+	if c.Auth.Nick == "" || c.Auth.Hostname == "" {
+		return fmt.Errorf("auth.nick and auth.hostname are required")
+	}
+
+	if _, ok := c.Networks[c.HomeNetwork]; !ok {
+		return fmt.Errorf("home_network %q not found in networks", c.HomeNetwork)
 	}
 
 	for name, net := range c.Networks {
@@ -151,9 +129,6 @@ func (c *Config) Validate() error {
 		}
 		if net.NickPrefix == "" {
 			return fmt.Errorf("network %q has no nick_prefix configured", name)
-		}
-		if net.MaxClientsPerIP <= 0 {
-			return fmt.Errorf("network %q max_clients_per_ip must be > 0", name)
 		}
 	}
 

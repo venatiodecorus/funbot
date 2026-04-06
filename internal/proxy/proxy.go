@@ -35,7 +35,7 @@ type Proxy struct {
 	Username string
 	Password string
 	Healthy  bool
-	InUse    bool // Whether this proxy is assigned to an active client
+	Networks map[string]bool // networks this proxy is currently connected to
 	LastUsed time.Time
 	LastFail time.Time
 	UseCount int
@@ -142,17 +142,18 @@ func (p *Pool) Reload() error {
 	return p.LoadFromFile(file)
 }
 
-// Acquire returns the next available healthy proxy and marks it as in use.
-// Returns nil if no healthy proxies are available. Prefers proxies that
-// are not currently in use; falls back to least-recently-used healthy proxy.
-func (p *Pool) Acquire() *Proxy {
+// AcquireForNetwork returns the next available healthy proxy that is not
+// already connected to the given network. A single proxy can serve
+// connections to multiple different networks simultaneously.
+// Returns nil if no suitable proxy is available.
+func (p *Pool) AcquireForNetwork(network string) *Proxy {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// First pass: find the least-recently-used healthy proxy that is NOT in use
+	// First pass: find least-recently-used healthy proxy NOT on this network
 	var best *Proxy
 	for _, px := range p.proxies {
-		if !px.Healthy || px.InUse {
+		if !px.Healthy || px.Networks[network] {
 			continue
 		}
 		if best == nil || px.LastUsed.Before(best.LastUsed) {
@@ -160,76 +161,66 @@ func (p *Pool) Acquire() *Proxy {
 		}
 	}
 
-	// Second pass: if all healthy proxies are in use, allow reuse
-	// (multiple clients may share a proxy if pool is small)
-	if best == nil {
-		for _, px := range p.proxies {
-			if !px.Healthy {
-				continue
-			}
-			if best == nil || px.UseCount < best.UseCount {
-				best = px
-			}
-		}
-	}
-
 	if best != nil {
-		best.InUse = true
+		best.Networks[network] = true
 		best.LastUsed = time.Now()
 		best.UseCount++
-		p.log.Debug("proxy acquired",
+		p.log.Debug("proxy acquired for network",
 			"proxy", best.ProxyAddress(),
+			"network", network,
 			"use_count", best.UseCount,
-			"in_use", p.inUseCountLocked(),
-			"available", p.availableCountLocked(),
+			"available_for_network", p.availableForNetworkLocked(network),
 		)
 	} else {
-		p.log.Warn("no healthy proxies available", "total", len(p.proxies))
+		p.log.Warn("no healthy proxies available for network",
+			"network", network,
+			"total", len(p.proxies),
+		)
 	}
 
 	return best
 }
 
-// Release marks a proxy as no longer in active use.
+// ReleaseFromNetwork releases a proxy from a specific network.
 // If failed is true, the proxy is also marked unhealthy.
-func (p *Pool) Release(px *Proxy, failed bool) {
+func (p *Pool) ReleaseFromNetwork(px *Proxy, network string, failed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	px.InUse = false
+	delete(px.Networks, network)
 
 	if failed {
 		px.Healthy = false
 		px.LastFail = time.Now()
-		p.log.Warn("proxy released and marked unhealthy",
+		p.log.Warn("proxy released from network and marked unhealthy",
 			"proxy", px.ProxyAddress(),
-			"in_use", p.inUseCountLocked(),
-			"available", p.availableCountLocked(),
+			"network", network,
 		)
 	} else {
-		p.log.Debug("proxy released",
+		p.log.Debug("proxy released from network",
 			"proxy", px.ProxyAddress(),
-			"in_use", p.inUseCountLocked(),
-			"available", p.availableCountLocked(),
+			"network", network,
 		)
 	}
 }
 
-// ReleaseByAddress releases a proxy matching the given address.
-// This is useful when the caller only has the address string (e.g., from irc.Client).
-func (p *Pool) ReleaseByAddress(addr string, failed bool) {
+// ReleaseByAddressFromNetwork releases a proxy matching the given address
+// from a specific network. Useful when the caller only has the address string.
+func (p *Pool) ReleaseByAddressFromNetwork(addr, network string, failed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for _, px := range p.proxies {
 		if px.ProxyAddress() == addr {
-			px.InUse = false
+			delete(px.Networks, network)
 			if failed {
 				px.Healthy = false
 				px.LastFail = time.Now()
-				p.log.Warn("proxy released by address and marked unhealthy", "proxy", addr)
+				p.log.Warn("proxy released by address from network and marked unhealthy",
+					"proxy", addr, "network", network)
 			} else {
-				p.log.Debug("proxy released by address", "proxy", addr)
+				p.log.Debug("proxy released by address from network",
+					"proxy", addr, "network", network)
 			}
 			return
 		}
@@ -264,36 +255,19 @@ func (p *Pool) HealthyCount() int {
 	return count
 }
 
-// InUseCount returns the number of proxies currently assigned to clients.
-func (p *Pool) InUseCount() int {
+// AvailableForNetwork returns the number of healthy proxies not currently
+// connected to the given network.
+func (p *Pool) AvailableForNetwork(network string) int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.inUseCountLocked()
+	return p.availableForNetworkLocked(network)
 }
 
-// AvailableCount returns the number of healthy proxies not currently in use.
-func (p *Pool) AvailableCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.availableCountLocked()
-}
-
-// inUseCountLocked returns in-use count (caller must hold lock).
-func (p *Pool) inUseCountLocked() int {
+// availableForNetworkLocked returns available count for a network (caller must hold lock).
+func (p *Pool) availableForNetworkLocked(network string) int {
 	count := 0
 	for _, px := range p.proxies {
-		if px.InUse {
-			count++
-		}
-	}
-	return count
-}
-
-// availableCountLocked returns available count (caller must hold lock).
-func (p *Pool) availableCountLocked() int {
-	count := 0
-	for _, px := range p.proxies {
-		if px.Healthy && !px.InUse {
+		if px.Healthy && !px.Networks[network] {
 			count++
 		}
 	}
@@ -321,13 +295,19 @@ func (px *Proxy) HasAuth() bool {
 	return px.Username != ""
 }
 
+// NetworkCount returns the number of networks this proxy is currently connected to.
+func (px *Proxy) NetworkCount() int {
+	return len(px.Networks)
+}
+
 // String returns a human-readable representation (without credentials).
 func (px *Proxy) String() string {
 	status := "healthy"
 	if !px.Healthy {
 		status = "unhealthy"
 	}
-	return fmt.Sprintf("socks5://%s:%s (%s, used %d times)", px.Host, px.Port, status, px.UseCount)
+	return fmt.Sprintf("socks5://%s:%s (%s, used %d times, %d networks)",
+		px.Host, px.Port, status, px.UseCount, len(px.Networks))
 }
 
 // StartHealthChecker runs a background goroutine that periodically tests
@@ -428,10 +408,11 @@ func parseProxy(raw string) (*Proxy, error) {
 	}
 
 	proxy := &Proxy{
-		URL:     raw,
-		Host:    host,
-		Port:    port,
-		Healthy: true,
+		URL:      raw,
+		Host:     host,
+		Port:     port,
+		Healthy:  true,
+		Networks: make(map[string]bool),
 	}
 
 	if u.User != nil {

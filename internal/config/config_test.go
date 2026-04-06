@@ -11,24 +11,20 @@ func TestLoad_ValidConfig(t *testing.T) {
 	cfgPath := filepath.Join(dir, "funbot.yaml")
 
 	content := `
-role: controller
-controller:
-  home_network: homenet
-  command_prefix: "!"
-  auth:
-    nick: admin
-    hostname: admin.host.com
-redis:
-  address: localhost:6379
+home_network: homenet
+command_prefix: "!"
+auth:
+  nick: admin
+  hostname: admin.host.com
 networks:
   homenet:
     servers:
       - "irc.test.net:6667"
     nick_prefix: bot
-    max_clients_per_ip: 3
     channels:
       - "#test"
     flood_delay_ms: 500
+    default_clients: 3
 logging:
   level: debug
   format: text
@@ -42,14 +38,14 @@ logging:
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	if cfg.Role != "controller" {
-		t.Errorf("expected role 'controller', got %q", cfg.Role)
+	if cfg.HomeNetwork != "homenet" {
+		t.Errorf("expected home_network 'homenet', got %q", cfg.HomeNetwork)
 	}
-	if cfg.Controller.HomeNetwork != "homenet" {
-		t.Errorf("expected home_network 'homenet', got %q", cfg.Controller.HomeNetwork)
+	if cfg.Auth.Nick != "admin" {
+		t.Errorf("expected auth nick 'admin', got %q", cfg.Auth.Nick)
 	}
-	if cfg.Controller.Auth.Nick != "admin" {
-		t.Errorf("expected auth nick 'admin', got %q", cfg.Controller.Auth.Nick)
+	if cfg.CommandPrefix != "!" {
+		t.Errorf("expected command_prefix '!', got %q", cfg.CommandPrefix)
 	}
 
 	net, ok := cfg.Networks["homenet"]
@@ -59,39 +55,11 @@ logging:
 	if len(net.Servers) != 1 || net.Servers[0] != "irc.test.net:6667" {
 		t.Errorf("unexpected servers: %v", net.Servers)
 	}
-	if net.MaxClientsPerIP != 3 {
-		t.Errorf("expected max_clients_per_ip 3, got %d", net.MaxClientsPerIP)
-	}
 	if net.FloodDelayMs != 500 {
 		t.Errorf("expected flood_delay_ms 500, got %d", net.FloodDelayMs)
 	}
-}
-
-func TestLoad_InvalidRole(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "funbot.yaml")
-
-	content := `
-role: invalid
-controller:
-  home_network: homenet
-  auth:
-    nick: admin
-    hostname: admin.host.com
-networks:
-  homenet:
-    servers:
-      - "irc.test.net:6667"
-    nick_prefix: bot
-    max_clients_per_ip: 3
-`
-	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := Load(cfgPath)
-	if err == nil {
-		t.Fatal("expected error for invalid role")
+	if net.DefaultClients != 3 {
+		t.Errorf("expected default_clients 3, got %d", net.DefaultClients)
 	}
 }
 
@@ -100,18 +68,15 @@ func TestLoad_MissingHomeNetwork(t *testing.T) {
 	cfgPath := filepath.Join(dir, "funbot.yaml")
 
 	content := `
-role: controller
-controller:
-  home_network: nonexistent
-  auth:
-    nick: admin
-    hostname: admin.host.com
+home_network: nonexistent
+auth:
+  nick: admin
+  hostname: admin.host.com
 networks:
   homenet:
     servers:
       - "irc.test.net:6667"
     nick_prefix: bot
-    max_clients_per_ip: 3
 `
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -123,6 +88,28 @@ networks:
 	}
 }
 
+func TestLoad_MissingAuth(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "funbot.yaml")
+
+	content := `
+home_network: homenet
+networks:
+  homenet:
+    servers:
+      - "irc.test.net:6667"
+    nick_prefix: bot
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for missing auth")
+	}
+}
+
 func TestNetwork_FloodDelay(t *testing.T) {
 	n := Network{FloodDelayMs: 500}
 	d := n.FloodDelay()
@@ -131,43 +118,26 @@ func TestNetwork_FloodDelay(t *testing.T) {
 	}
 }
 
-func TestLoad_EnvOverride(t *testing.T) {
+func TestLoad_MissingNickPrefix(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "funbot.yaml")
 
 	content := `
-role: controller
-controller:
-  home_network: homenet
-  auth:
-    nick: admin
-    hostname: admin.host.com
+home_network: homenet
+auth:
+  nick: admin
+  hostname: admin.host.com
 networks:
   homenet:
     servers:
       - "irc.test.net:6667"
-    nick_prefix: bot
-    max_clients_per_ip: 3
 `
 	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Set env var to override role
-	t.Setenv("FUNBOT_ROLE", "worker")
-
-	cfg, err := Load(cfgPath)
-	// Worker role doesn't need home_network validation, but our
-	// current validator requires it. For this test we just check
-	// that viper picked up the env var.
-	// The error is expected since worker validation is different.
-	if err != nil {
-		// Worker role doesn't validate controller fields
-		// so this might pass or fail depending on validation logic
-		_ = cfg
-		return
-	}
-	if cfg.Role != "worker" {
-		t.Errorf("expected role 'worker' from env, got %q", cfg.Role)
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for missing nick_prefix")
 	}
 }

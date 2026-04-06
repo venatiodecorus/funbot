@@ -1,4 +1,4 @@
-package controller
+package bot
 
 import (
 	"fmt"
@@ -63,7 +63,7 @@ func (d *CommandDispatcher) Dispatch(rawMessage string) string {
 }
 
 // registerBuiltinCommands registers the commands that are handled
-// directly by the controller (context, help).
+// directly by the dispatcher (context, help).
 func (d *CommandDispatcher) registerBuiltinCommands() {
 	d.Register("context", d.handleContext)
 	d.Register("help", d.handleHelp)
