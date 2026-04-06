@@ -41,7 +41,7 @@ func TestFetchFromAPI(t *testing.T) {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -67,13 +67,13 @@ func TestFetchFromAPI_QueryParams(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(apiResponse{})
+		_ = json.NewEncoder(w).Encode(apiResponse{})
 	}))
 	defer srv.Close()
 
 	pool := NewPool(slog.Default())
 	pool.SetAPI(srv.URL, "socks5", 500)
-	pool.FetchFromAPI(context.Background())
+	_ = pool.FetchFromAPI(context.Background())
 
 	if gotQuery == "" {
 		t.Fatal("expected query parameters")
@@ -125,7 +125,7 @@ func TestFetchFromAPI_PreservesInUse(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -156,7 +156,7 @@ func TestFetchFromAPI_PreservesInUse(t *testing.T) {
 func TestFetchFromAPI_ServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
+		_, _ = w.Write([]byte("internal error"))
 	}))
 	defer srv.Close()
 

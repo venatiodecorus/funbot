@@ -343,7 +343,7 @@ func (c *Client) ProxyAddr() string {
 func (c *Client) Quit(reason string) {
 	if c.IsConnected() {
 		c.log.Info("sending QUIT", "reason", reason)
-		c.gircCli.Cmd.SendRaw("QUIT :" + reason)
+		_ = c.gircCli.Cmd.SendRaw("QUIT :" + reason)
 		// Give the server a moment to process the QUIT before closing
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -440,7 +440,7 @@ func (c *Client) SendRaw(raw string) {
 		c.flood.Wait()
 	}
 	c.log.Debug("sending raw command", "raw", raw)
-	c.gircCli.Cmd.SendRaw(raw)
+	_ = c.gircCli.Cmd.SendRaw(raw)
 }
 
 // FloodDelay returns the configured flood delay, or 0 if not set.

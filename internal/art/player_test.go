@@ -5,51 +5,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/venatiodecorus/funbot/internal/irc"
 )
-
-// mockClient creates a minimal IRC client for testing.
-// We use a real irc.Client but with a fake server (it won't connect).
-// We capture sent messages via a wrapper approach.
-// Since we can't easily mock girc, we test the Player logic by
-// tracking PrivmsgNoFlood calls via a recording wrapper.
-
-// messageRecord captures a message sent through a client.
-type messageRecord struct {
-	ClientID string
-	Target   string
-	Message  string
-	Time     time.Time
-}
-
-// messageRecorder tracks messages sent via PrivmsgNoFlood.
-type messageRecorder struct {
-	mu       sync.Mutex
-	messages []messageRecord
-}
-
-func (r *messageRecorder) record(clientID, target, message string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.messages = append(r.messages, messageRecord{
-		ClientID: clientID,
-		Target:   target,
-		Message:  message,
-		Time:     time.Now(),
-	})
-}
-
-func (r *messageRecorder) getMessages() []messageRecord {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	result := make([]messageRecord, len(r.messages))
-	copy(result, r.messages)
-	return result
-}
 
 func TestLoadArt(t *testing.T) {
 	dir := t.TempDir()

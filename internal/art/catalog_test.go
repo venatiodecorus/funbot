@@ -74,7 +74,7 @@ func TestCatalog_FindByName(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	tests := []struct {
 		name      string
@@ -102,7 +102,7 @@ func TestCatalog_FindByName_Category(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	entries := cat.FindByName("dragon")
 	if len(entries) != 1 {
@@ -125,7 +125,7 @@ func TestCatalog_Search(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	tests := []struct {
 		query     string
