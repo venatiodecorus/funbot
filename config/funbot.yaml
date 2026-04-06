@@ -20,6 +20,8 @@ proxies:
   protocol: "socks5"
   max_latency: 1000
   refresh_interval: "5m"
+  max_retries: 3        # consecutive failures before purging a proxy from pool
+  min_pool_size: 0       # minimum healthy proxies to maintain (0 = on-demand only)
 
 art:
   repo_url: "https://github.com/birdneststream/asciiart.git"

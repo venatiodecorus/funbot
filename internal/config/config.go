@@ -52,6 +52,15 @@ type ProxyConfig struct {
 	MaxLatency int `mapstructure:"max_latency"`
 	// RefreshInterval is how often to re-fetch proxies from the API.
 	RefreshInterval string `mapstructure:"refresh_interval"`
+	// MaxRetries is the number of consecutive connection failures before a proxy
+	// is purged from the pool entirely. 0 means purge on first failure (legacy
+	// behavior). Default is 3.
+	MaxRetries int `mapstructure:"max_retries"`
+	// MinPoolSize is the minimum number of healthy proxies to maintain in the
+	// pool. When the healthy count drops below this threshold, the pool
+	// automatically fetches more from the API during the background refresh
+	// cycle. 0 means no minimum (on-demand fetching only).
+	MinPoolSize int `mapstructure:"min_pool_size"`
 }
 
 // ArtConfig holds ASCII art repository configuration.
@@ -77,6 +86,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("art.repo_url", "https://github.com/birdneststream/asciiart.git")
 	v.SetDefault("art.local_path", "/data/asciiart")
 	v.SetDefault("art.update_interval", "1h")
+	v.SetDefault("proxies.max_retries", 3)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
 

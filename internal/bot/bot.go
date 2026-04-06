@@ -81,6 +81,12 @@ func New(cfg *config.Config, log *slog.Logger) (*Bot, error) {
 	if cfg.Proxies.APIURL != "" {
 		proxyPool.SetAPI(cfg.Proxies.APIURL, cfg.Proxies.Protocol, cfg.Proxies.MaxLatency)
 	}
+	if cfg.Proxies.MaxRetries > 0 {
+		proxyPool.SetMaxRetries(cfg.Proxies.MaxRetries)
+	}
+	if cfg.Proxies.MinPoolSize > 0 {
+		proxyPool.SetMinPoolSize(cfg.Proxies.MinPoolSize)
+	}
 
 	// Set up art repo and catalog
 	var artRepo *art.Repo

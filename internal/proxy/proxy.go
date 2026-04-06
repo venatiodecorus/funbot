@@ -26,6 +26,10 @@ const (
 
 	// DefaultHealthCheckTimeout is the timeout for proxy connectivity checks.
 	DefaultHealthCheckTimeout = 10 * time.Second
+
+	// DefaultMaxRetries is the default number of consecutive connection failures
+	// before a proxy is purged from the pool.
+	DefaultMaxRetries = 3
 )
 
 // apiProxy is the JSON structure returned by the proxy-scanner API.
@@ -48,31 +52,35 @@ type apiResponse struct {
 
 // Proxy represents a single SOCKS5 proxy.
 type Proxy struct {
-	Host     string
-	Port     string
-	Healthy  bool
-	Networks map[string]bool // networks this proxy is currently connected to
-	Country  string
-	LastUsed time.Time
-	LastFail time.Time
-	UseCount int
+	Host      string
+	Port      string
+	Healthy   bool
+	Networks  map[string]bool // networks this proxy is currently connected to
+	Country   string
+	LastUsed  time.Time
+	LastFail  time.Time
+	UseCount  int
+	FailCount int // consecutive connection failures
 }
 
 // Pool manages a collection of proxies fetched from the proxy-scanner API.
 type Pool struct {
-	proxies  []*Proxy
-	mu       sync.RWMutex
-	log      *slog.Logger
-	apiURL   string
-	protocol string
-	maxLat   int
-	client   *http.Client
+	proxies     []*Proxy
+	mu          sync.RWMutex
+	log         *slog.Logger
+	apiURL      string
+	protocol    string
+	maxLat      int
+	maxRetries  int // consecutive failures before purging a proxy
+	minPoolSize int // minimum healthy proxies to maintain
+	client      *http.Client
 }
 
 // NewPool creates a new proxy pool.
 func NewPool(log *slog.Logger) *Pool {
 	return &Pool{
-		log: log.With("component", "proxy"),
+		log:        log.With("component", "proxy"),
+		maxRetries: DefaultMaxRetries,
 		client: &http.Client{
 			Timeout: DefaultAPITimeout,
 		},
@@ -86,6 +94,23 @@ func (p *Pool) SetAPI(apiURL, protocol string, maxLatency int) {
 	p.apiURL = apiURL
 	p.protocol = protocol
 	p.maxLat = maxLatency
+}
+
+// SetMaxRetries configures the number of consecutive failures before a proxy
+// is purged from the pool. A value of 0 means purge on first failure.
+func (p *Pool) SetMaxRetries(maxRetries int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxRetries = maxRetries
+}
+
+// SetMinPoolSize configures the minimum number of healthy proxies to maintain.
+// The background refresher will auto-fetch from the API when the healthy count
+// drops below this threshold. A value of 0 disables this behavior.
+func (p *Pool) SetMinPoolSize(minPoolSize int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.minPoolSize = minPoolSize
 }
 
 // FetchFromAPI fetches proxies from the proxy-scanner API and replaces the
@@ -184,7 +209,8 @@ func (p *Pool) FetchFromAPI(ctx context.Context) error {
 }
 
 // StartRefresher runs a background goroutine that periodically re-fetches
-// proxies from the API.
+// proxies from the API and refills the pool if healthy count is below the
+// configured minimum.
 func (p *Pool) StartRefresher(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = DefaultRefreshInterval
@@ -202,6 +228,10 @@ func (p *Pool) StartRefresher(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			if err := p.FetchFromAPI(ctx); err != nil {
 				p.log.Error("failed to refresh proxies from API", "error", err)
+			}
+			// After regular refresh, check if we still need more
+			if err := p.RefillIfNeeded(ctx); err != nil {
+				p.log.Error("failed to refill proxy pool", "error", err)
 			}
 		}
 	}
@@ -247,7 +277,8 @@ func (p *Pool) AcquireForNetwork(network string) *Proxy {
 }
 
 // ReleaseFromNetwork releases a proxy from a specific network.
-// If failed is true, the proxy is also marked unhealthy.
+// If failed is true, the proxy's failure count is incremented. Once the
+// failure count exceeds maxRetries the proxy is purged from the pool.
 func (p *Pool) ReleaseFromNetwork(px *Proxy, network string, failed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -255,13 +286,30 @@ func (p *Pool) ReleaseFromNetwork(px *Proxy, network string, failed bool) {
 	delete(px.Networks, network)
 
 	if failed {
-		px.Healthy = false
+		px.FailCount++
 		px.LastFail = time.Now()
-		p.log.Warn("proxy released from network and marked unhealthy",
-			"proxy", px.ProxyAddress(),
-			"network", network,
-		)
+
+		if px.FailCount > p.maxRetries {
+			// Purge from pool
+			p.removeProxyLocked(px)
+			p.log.Warn("proxy purged from pool after exceeding max retries",
+				"proxy", px.ProxyAddress(),
+				"network", network,
+				"fail_count", px.FailCount,
+				"max_retries", p.maxRetries,
+			)
+		} else {
+			px.Healthy = false
+			p.log.Warn("proxy released from network and marked unhealthy",
+				"proxy", px.ProxyAddress(),
+				"network", network,
+				"fail_count", px.FailCount,
+				"max_retries", p.maxRetries,
+			)
+		}
 	} else {
+		// Successful release resets the failure counter
+		px.FailCount = 0
 		p.log.Debug("proxy released from network",
 			"proxy", px.ProxyAddress(),
 			"network", network,
@@ -279,11 +327,22 @@ func (p *Pool) ReleaseByAddressFromNetwork(addr, network string, failed bool) {
 		if px.ProxyAddress() == addr {
 			delete(px.Networks, network)
 			if failed {
-				px.Healthy = false
+				px.FailCount++
 				px.LastFail = time.Now()
-				p.log.Warn("proxy released by address from network and marked unhealthy",
-					"proxy", addr, "network", network)
+
+				if px.FailCount > p.maxRetries {
+					p.removeProxyLocked(px)
+					p.log.Warn("proxy purged from pool after exceeding max retries",
+						"proxy", addr, "network", network,
+						"fail_count", px.FailCount, "max_retries", p.maxRetries)
+				} else {
+					px.Healthy = false
+					p.log.Warn("proxy released by address from network and marked unhealthy",
+						"proxy", addr, "network", network,
+						"fail_count", px.FailCount, "max_retries", p.maxRetries)
+				}
 			} else {
+				px.FailCount = 0
 				p.log.Debug("proxy released by address from network",
 					"proxy", addr, "network", network)
 			}
@@ -330,6 +389,76 @@ func (p *Pool) availableForNetworkLocked(network string) int {
 		}
 	}
 	return count
+}
+
+// removeProxyLocked removes a proxy from the pool. Caller must hold p.mu.
+func (p *Pool) removeProxyLocked(px *Proxy) {
+	for i, candidate := range p.proxies {
+		if candidate == px {
+			p.proxies = append(p.proxies[:i], p.proxies[i+1:]...)
+			return
+		}
+	}
+}
+
+// EnsureAvailable checks whether at least `count` healthy proxies are
+// available for the given network. If not, it fetches more from the API
+// (up to maxAttempts rounds) until enough are available or the API has
+// nothing new to offer. It returns the number currently available.
+func (p *Pool) EnsureAvailable(ctx context.Context, network string, count int) (int, error) {
+	const maxAttempts = 3
+
+	available := p.AvailableForNetwork(network)
+	if available >= count {
+		return available, nil
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		p.log.Info("pool needs more proxies, fetching from API",
+			"network", network,
+			"need", count,
+			"available", available,
+			"attempt", attempt+1,
+		)
+		if err := p.FetchFromAPI(ctx); err != nil {
+			return available, fmt.Errorf("fetching proxies on demand: %w", err)
+		}
+
+		newAvailable := p.AvailableForNetwork(network)
+		if newAvailable >= count {
+			return newAvailable, nil
+		}
+		// If the API didn't give us any new proxies, stop trying
+		if newAvailable <= available {
+			break
+		}
+		available = newAvailable
+	}
+
+	return p.AvailableForNetwork(network), nil
+}
+
+// RefillIfNeeded checks if the healthy proxy count has dropped below the
+// configured minimum pool size and fetches more from the API if so.
+func (p *Pool) RefillIfNeeded(ctx context.Context) error {
+	p.mu.RLock()
+	minSize := p.minPoolSize
+	p.mu.RUnlock()
+
+	if minSize <= 0 {
+		return nil
+	}
+
+	healthy := p.HealthyCount()
+	if healthy >= minSize {
+		return nil
+	}
+
+	p.log.Info("healthy proxy count below minimum, refilling",
+		"healthy", healthy,
+		"min_pool_size", minSize,
+	)
+	return p.FetchFromAPI(ctx)
 }
 
 // All returns a snapshot of all proxies (for status reporting).

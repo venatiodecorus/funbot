@@ -83,7 +83,8 @@ func (nm *NetworkManager) Start(ctx context.Context) error {
 }
 
 // AddClients creates and connects additional IRC clients using proxies.
-// Returns the number of clients actually added.
+// Returns the number of clients actually added. When the proxy pool runs
+// low, it attempts to fetch more from the API on demand before giving up.
 func (nm *NetworkManager) AddClients(count int) (int, error) {
 	if count <= 0 {
 		return 0, fmt.Errorf("count must be > 0")
@@ -96,6 +97,16 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 	server, port, err := parseServerAddr(nm.netCfg.Servers[0])
 	if err != nil {
 		return 0, fmt.Errorf("parsing server address: %w", err)
+	}
+
+	// Try to ensure enough proxies are available before starting
+	ctx := nm.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if avail, err := nm.proxyPool.EnsureAvailable(ctx, nm.network, count); err != nil {
+		nm.log.Warn("failed to fetch additional proxies on demand",
+			"error", err, "available", avail, "requested", count)
 	}
 
 	added := 0

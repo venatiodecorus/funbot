@@ -309,3 +309,206 @@ func TestProxyNetworkCount(t *testing.T) {
 		t.Errorf("expected 2 networks, got %d", px.NetworkCount())
 	}
 }
+
+func TestPoolFailCountAndPurge(t *testing.T) {
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+	)
+	pool.maxRetries = 2
+
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy")
+	}
+
+	// First failure: FailCount=1, still in pool (marked unhealthy)
+	pool.ReleaseFromNetwork(p1, "efnet", true)
+	if p1.FailCount != 1 {
+		t.Errorf("expected fail count 1, got %d", p1.FailCount)
+	}
+	if p1.Healthy {
+		t.Error("expected proxy to be marked unhealthy after first failure")
+	}
+	if pool.Count() != 2 {
+		t.Errorf("expected 2 proxies still in pool, got %d", pool.Count())
+	}
+
+	// Re-acquire (it's unhealthy so can't acquire it), but let's manually reset
+	// and simulate another failure cycle
+	p1.Healthy = true
+	p1.Networks["efnet"] = true
+
+	// Second failure: FailCount=2, still in pool
+	pool.ReleaseFromNetwork(p1, "efnet", true)
+	if p1.FailCount != 2 {
+		t.Errorf("expected fail count 2, got %d", p1.FailCount)
+	}
+	if pool.Count() != 2 {
+		t.Errorf("expected 2 proxies still in pool, got %d", pool.Count())
+	}
+
+	// Third failure: FailCount=3, exceeds maxRetries=2, should be purged
+	p1.Healthy = true
+	p1.Networks["efnet"] = true
+	pool.ReleaseFromNetwork(p1, "efnet", true)
+	if pool.Count() != 1 {
+		t.Errorf("expected 1 proxy after purge, got %d", pool.Count())
+	}
+}
+
+func TestPoolFailCountResetOnSuccess(t *testing.T) {
+	pool := newTestPool(t, makeProxy("1.2.3.4", "1080"))
+	pool.maxRetries = 2
+
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy")
+	}
+
+	// Fail once
+	pool.ReleaseFromNetwork(p1, "efnet", true)
+	if p1.FailCount != 1 {
+		t.Errorf("expected fail count 1, got %d", p1.FailCount)
+	}
+
+	// Successful release resets counter
+	p1.Healthy = true
+	p1.Networks["efnet"] = true
+	pool.ReleaseFromNetwork(p1, "efnet", false)
+	if p1.FailCount != 0 {
+		t.Errorf("expected fail count reset to 0, got %d", p1.FailCount)
+	}
+}
+
+func TestPoolReleaseByAddressPurge(t *testing.T) {
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+	)
+	pool.maxRetries = 0 // purge on first failure
+
+	p1 := pool.AcquireForNetwork("efnet")
+	if p1 == nil {
+		t.Fatal("expected a proxy")
+	}
+	addr := p1.ProxyAddress()
+
+	// One failure with maxRetries=0: FailCount=1 > 0 = purged
+	pool.ReleaseByAddressFromNetwork(addr, "efnet", true)
+	if pool.Count() != 1 {
+		t.Errorf("expected 1 proxy after purge, got %d", pool.Count())
+	}
+}
+
+func TestEnsureAvailable(t *testing.T) {
+	fetchCount := 0
+	resp := apiResponse{
+		Proxies: []apiProxy{
+			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true},
+			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
+			{IP: "9.10.11.12", Port: 1080, Protocol: "socks5", Alive: true},
+		},
+		Total: 3,
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCount++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "", 0)
+
+	// Pool is empty, EnsureAvailable should trigger a fetch
+	avail, err := pool.EnsureAvailable(context.Background(), "efnet", 2)
+	if err != nil {
+		t.Fatalf("EnsureAvailable error: %v", err)
+	}
+	if avail < 2 {
+		t.Errorf("expected at least 2 available, got %d", avail)
+	}
+	if fetchCount == 0 {
+		t.Error("expected at least one API fetch")
+	}
+}
+
+func TestEnsureAvailable_AlreadySufficient(t *testing.T) {
+	fetchCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCount++
+		_ = json.NewEncoder(w).Encode(apiResponse{})
+	}))
+	defer srv.Close()
+
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+	)
+	pool.SetAPI(srv.URL, "", 0)
+
+	// Already have 2 available, asking for 2 should not fetch
+	avail, err := pool.EnsureAvailable(context.Background(), "efnet", 2)
+	if err != nil {
+		t.Fatalf("EnsureAvailable error: %v", err)
+	}
+	if avail < 2 {
+		t.Errorf("expected at least 2 available, got %d", avail)
+	}
+	if fetchCount != 0 {
+		t.Errorf("expected no API fetches, got %d", fetchCount)
+	}
+}
+
+func TestRefillIfNeeded(t *testing.T) {
+	fetchCount := 0
+	resp := apiResponse{
+		Proxies: []apiProxy{
+			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true},
+			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
+		},
+		Total: 2,
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCount++
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "", 0)
+	pool.SetMinPoolSize(5)
+
+	// Pool is empty, healthy count (0) < minPoolSize (5) -> should fetch
+	err := pool.RefillIfNeeded(context.Background())
+	if err != nil {
+		t.Fatalf("RefillIfNeeded error: %v", err)
+	}
+	if fetchCount == 0 {
+		t.Error("expected an API fetch")
+	}
+}
+
+func TestRefillIfNeeded_Disabled(t *testing.T) {
+	fetchCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCount++
+		_ = json.NewEncoder(w).Encode(apiResponse{})
+	}))
+	defer srv.Close()
+
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "", 0)
+	// minPoolSize defaults to 0 (disabled)
+
+	err := pool.RefillIfNeeded(context.Background())
+	if err != nil {
+		t.Fatalf("RefillIfNeeded error: %v", err)
+	}
+	if fetchCount != 0 {
+		t.Errorf("expected no API fetches when min_pool_size=0, got %d", fetchCount)
+	}
+}
