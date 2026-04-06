@@ -1,0 +1,11 @@
+bin/
+.git/
+.github/
+.gitignore
+.dockerignore
+.env
+.ocx
+.opencode
+*.md
+LICENSE
+test/

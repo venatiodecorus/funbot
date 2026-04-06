@@ -4,7 +4,9 @@
 BINARY := funbot
 MODULE := github.com/venatiodecorus/funbot
 GOFLAGS := -trimpath
-LDFLAGS := -s -w
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
 build:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/funbot
@@ -37,13 +39,20 @@ clean:
 	rm -rf bin/
 
 docker:
-	docker build -f deploy/docker/Dockerfile -t funbot:latest .
+	docker build -f deploy/docker/Dockerfile \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		-t funbot:$(VERSION) \
+		-t funbot:latest .
 
 docker-up:
-	docker compose -f deploy/docker-compose.yaml up --build
+	docker compose -f deploy/docker-compose.yaml up -d
 
 docker-down:
 	docker compose -f deploy/docker-compose.yaml down
+
+docker-pull:
+	docker compose -f deploy/docker-compose.yaml pull
 
 deps:
 	go mod tidy

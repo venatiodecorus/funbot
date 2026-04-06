@@ -18,6 +18,9 @@ import (
 	"github.com/venatiodecorus/funbot/internal/proxy"
 )
 
+// DefaultProxyRefreshInterval is how often to re-fetch proxies from the API.
+const DefaultProxyRefreshInterval = 5 * time.Minute
+
 // Bot is the single-process Funbot that manages all IRC connections.
 type Bot struct {
 	cfg        *config.Config
@@ -75,15 +78,8 @@ func New(cfg *config.Config, log *slog.Logger) (*Bot, error) {
 
 	// Set up proxy pool
 	proxyPool := proxy.NewPool(log)
-	if cfg.Proxies.File != "" {
-		if err := proxyPool.LoadFromFile(cfg.Proxies.File); err != nil {
-			log.Warn("failed to load proxy file", "error", err)
-		}
-	}
-	if len(cfg.Proxies.List) > 0 {
-		if err := proxyPool.LoadFromList(cfg.Proxies.List); err != nil {
-			log.Warn("failed to load proxy list", "error", err)
-		}
+	if cfg.Proxies.APIURL != "" {
+		proxyPool.SetAPI(cfg.Proxies.APIURL, cfg.Proxies.Protocol, cfg.Proxies.MaxLatency)
 	}
 
 	// Set up art repo and catalog
@@ -148,9 +144,20 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start proxy health checker if we have proxies
-	if b.proxyPool.Count() > 0 {
-		go b.proxyPool.StartHealthChecker(ctx)
+	// Fetch initial proxies from API
+	if b.cfg.Proxies.APIURL != "" {
+		if err := b.proxyPool.FetchFromAPI(ctx); err != nil {
+			b.log.Warn("failed to fetch initial proxies from API", "error", err)
+		}
+
+		// Start background refresher
+		refreshInterval := DefaultProxyRefreshInterval
+		if b.cfg.Proxies.RefreshInterval != "" {
+			if d, err := time.ParseDuration(b.cfg.Proxies.RefreshInterval); err == nil {
+				refreshInterval = d
+			}
+		}
+		go b.proxyPool.StartRefresher(ctx, refreshInterval)
 	}
 
 	// Start configured non-home networks

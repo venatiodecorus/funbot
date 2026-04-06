@@ -1,10 +1,9 @@
 services:
   funbot:
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
+    image: ghcr.io/venatiodecorus/funbot:latest
+    restart: unless-stopped
     volumes:
-      - ../../config:/etc/funbot:ro
+      - ./config:/etc/funbot:ro
       - art-data:/data/asciiart
 
 volumes:

@@ -42,10 +42,16 @@ func (n Network) FloodDelay() time.Duration {
 	return time.Duration(n.FloodDelayMs) * time.Millisecond
 }
 
-// ProxyConfig holds proxy list configuration.
+// ProxyConfig holds proxy API configuration.
 type ProxyConfig struct {
-	File string   `mapstructure:"file"`
-	List []string `mapstructure:"list"`
+	// APIURL is the base URL of the proxy-scanner API (e.g. "http://localhost:8080").
+	APIURL string `mapstructure:"api_url"`
+	// Protocol filters which proxy protocol to request (e.g. "socks5", "socks4").
+	Protocol string `mapstructure:"protocol"`
+	// MaxLatency filters proxies by maximum latency in milliseconds.
+	MaxLatency int `mapstructure:"max_latency"`
+	// RefreshInterval is how often to re-fetch proxies from the API.
+	RefreshInterval string `mapstructure:"refresh_interval"`
 }
 
 // ArtConfig holds ASCII art repository configuration.

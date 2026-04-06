@@ -1,145 +1,210 @@
-// Package proxy manages a pool of SOCKS5 proxies for IRC client connections.
+// Package proxy manages a pool of SOCKS5 proxies sourced from a
+// proxy-scanner API for IRC client connections.
 package proxy
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/net/proxy"
+	netproxy "golang.org/x/net/proxy"
 )
 
 const (
-	// DefaultHealthCheckInterval is how often to check unhealthy proxies.
-	DefaultHealthCheckInterval = 2 * time.Minute
+	// DefaultRefreshInterval is how often to re-fetch proxies from the API.
+	DefaultRefreshInterval = 5 * time.Minute
 
-	// DefaultHealthCheckTimeout is the timeout for proxy health checks.
+	// DefaultAPITimeout is the HTTP timeout for API requests.
+	DefaultAPITimeout = 10 * time.Second
+
+	// DefaultHealthCheckTimeout is the timeout for proxy connectivity checks.
 	DefaultHealthCheckTimeout = 10 * time.Second
-
-	// DefaultRecoveryDelay is the minimum time after failure before retrying.
-	DefaultRecoveryDelay = 1 * time.Minute
 )
+
+// apiProxy is the JSON structure returned by the proxy-scanner API.
+type apiProxy struct {
+	ID        int     `json:"id"`
+	IP        string  `json:"ip"`
+	Port      int     `json:"port"`
+	Protocol  string  `json:"protocol"`
+	Anonymity string  `json:"anonymity"`
+	Country   string  `json:"country"`
+	LatencyMs float64 `json:"latency_ms"`
+	Alive     bool    `json:"alive"`
+}
+
+// apiResponse is the JSON wrapper returned by the proxy-scanner /v1/proxies endpoint.
+type apiResponse struct {
+	Proxies []apiProxy `json:"proxies"`
+	Total   int        `json:"total"`
+}
 
 // Proxy represents a single SOCKS5 proxy.
 type Proxy struct {
-	URL      string
 	Host     string
 	Port     string
-	Username string
-	Password string
 	Healthy  bool
 	Networks map[string]bool // networks this proxy is currently connected to
+	Country  string
 	LastUsed time.Time
 	LastFail time.Time
 	UseCount int
 }
 
-// Pool manages a collection of proxies and handles assignment to clients.
+// Pool manages a collection of proxies fetched from the proxy-scanner API.
 type Pool struct {
-	proxies    []*Proxy
-	mu         sync.RWMutex
-	log        *slog.Logger
-	sourceFile string
+	proxies  []*Proxy
+	mu       sync.RWMutex
+	log      *slog.Logger
+	apiURL   string
+	protocol string
+	maxLat   int
+	client   *http.Client
 }
 
 // NewPool creates a new proxy pool.
 func NewPool(log *slog.Logger) *Pool {
 	return &Pool{
 		log: log.With("component", "proxy"),
+		client: &http.Client{
+			Timeout: DefaultAPITimeout,
+		},
 	}
 }
 
-// LoadFromFile reads proxies from a file, one per line.
-// Format: socks5://host:port or socks5://user:pass@host:port
-// Lines starting with # are comments. Empty lines are skipped.
-func (p *Pool) LoadFromFile(path string) error {
-	if path == "" {
-		return nil
+// SetAPI configures the proxy-scanner API endpoint and filter parameters.
+func (p *Pool) SetAPI(apiURL, protocol string, maxLatency int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.apiURL = apiURL
+	p.protocol = protocol
+	p.maxLat = maxLatency
+}
+
+// FetchFromAPI fetches proxies from the proxy-scanner API and replaces the
+// pool contents. Proxies that are currently in use (assigned to a network)
+// are preserved and merged with the fresh list.
+func (p *Pool) FetchFromAPI(ctx context.Context) error {
+	if p.apiURL == "" {
+		return fmt.Errorf("proxy API URL not configured")
 	}
 
-	f, err := os.Open(path)
+	u, err := url.Parse(p.apiURL + "/v1/proxies")
 	if err != nil {
-		return fmt.Errorf("opening proxy file %s: %w", path, err)
+		return fmt.Errorf("parsing API URL: %w", err)
 	}
-	defer f.Close()
+
+	q := u.Query()
+	if p.protocol != "" {
+		q.Set("protocol", p.protocol)
+	}
+	if p.maxLat > 0 {
+		q.Set("max_latency", fmt.Sprintf("%d", p.maxLat))
+	}
+	q.Set("limit", "1000")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("creating API request: %w", err)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetching proxies from API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var apiResp apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return fmt.Errorf("decoding API response: %w", err)
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.sourceFile = path
-	p.proxies = nil
-
-	scanner := bufio.NewScanner(f)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	// Build a set of currently in-use proxies (assigned to networks) so we
+	// can preserve their state across refreshes.
+	inUse := make(map[string]*Proxy)
+	for _, px := range p.proxies {
+		if len(px.Networks) > 0 {
+			inUse[px.ProxyAddress()] = px
 		}
-
-		proxy, err := parseProxy(line)
-		if err != nil {
-			p.log.Warn("skipping invalid proxy", "line", lineNum, "error", err)
-			continue
-		}
-
-		p.proxies = append(p.proxies, proxy)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("reading proxy file: %w", err)
+	var newProxies []*Proxy
+	for _, ap := range apiResp.Proxies {
+		if !ap.Alive {
+			continue
+		}
+		addr := fmt.Sprintf("%s:%d", ap.IP, ap.Port)
+		if existing, ok := inUse[addr]; ok {
+			// Preserve the in-use proxy with its network assignments
+			existing.Healthy = true
+			existing.Country = ap.Country
+			newProxies = append(newProxies, existing)
+			delete(inUse, addr)
+		} else {
+			newProxies = append(newProxies, &Proxy{
+				Host:     ap.IP,
+				Port:     fmt.Sprintf("%d", ap.Port),
+				Healthy:  true,
+				Networks: make(map[string]bool),
+				Country:  ap.Country,
+			})
+		}
 	}
 
-	p.log.Info("loaded proxies", "count", len(p.proxies), "file", path)
+	// Keep any in-use proxies that disappeared from the API (still connected).
+	for _, px := range inUse {
+		px.Healthy = false // mark unhealthy since API no longer reports it
+		newProxies = append(newProxies, px)
+	}
+
+	p.proxies = newProxies
+	p.log.Info("refreshed proxies from API",
+		"fetched", len(apiResp.Proxies),
+		"alive", len(newProxies),
+		"preserved_in_use", len(inUse),
+	)
+
 	return nil
 }
 
-// LoadFromList loads proxies from a string slice.
-func (p *Pool) LoadFromList(list []string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.proxies = nil
-
-	for i, line := range list {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		proxy, err := parseProxy(line)
-		if err != nil {
-			p.log.Warn("skipping invalid proxy", "index", i, "error", err)
-			continue
-		}
-
-		p.proxies = append(p.proxies, proxy)
+// StartRefresher runs a background goroutine that periodically re-fetches
+// proxies from the API.
+func (p *Pool) StartRefresher(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultRefreshInterval
 	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	p.log.Info("loaded proxies from list", "count", len(p.proxies))
-	return nil
-}
+	p.log.Info("proxy refresher started", "interval", interval)
 
-// Reload re-reads proxies from the original source file.
-func (p *Pool) Reload() error {
-	p.mu.RLock()
-	file := p.sourceFile
-	p.mu.RUnlock()
-
-	if file == "" {
-		return fmt.Errorf("no source file to reload from")
+	for {
+		select {
+		case <-ctx.Done():
+			p.log.Info("proxy refresher stopped")
+			return
+		case <-ticker.C:
+			if err := p.FetchFromAPI(ctx); err != nil {
+				p.log.Error("failed to refresh proxies from API", "error", err)
+			}
+		}
 	}
-
-	p.log.Info("reloading proxies", "file", file)
-	return p.LoadFromFile(file)
 }
 
 // AcquireForNetwork returns the next available healthy proxy that is not
@@ -150,7 +215,7 @@ func (p *Pool) AcquireForNetwork(network string) *Proxy {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// First pass: find least-recently-used healthy proxy NOT on this network
+	// Find least-recently-used healthy proxy NOT on this network
 	var best *Proxy
 	for _, px := range p.proxies {
 		if !px.Healthy || px.Networks[network] {
@@ -227,13 +292,6 @@ func (p *Pool) ReleaseByAddressFromNetwork(addr, network string, failed bool) {
 	}
 }
 
-// MarkHealthy marks a specific proxy as healthy again.
-func (p *Pool) MarkHealthy(proxy *Proxy) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	proxy.Healthy = true
-}
-
 // Count returns the total number of loaded proxies.
 func (p *Pool) Count() int {
 	p.mu.RLock()
@@ -285,14 +343,8 @@ func (p *Pool) All() []*Proxy {
 }
 
 // ProxyAddress returns the SOCKS5 address string for dialing.
-// Format: "host:port"
 func (px *Proxy) ProxyAddress() string {
 	return px.Host + ":" + px.Port
-}
-
-// HasAuth returns whether this proxy requires authentication.
-func (px *Proxy) HasAuth() bool {
-	return px.Username != ""
 }
 
 // NetworkCount returns the number of networks this proxy is currently connected to.
@@ -300,125 +352,35 @@ func (px *Proxy) NetworkCount() int {
 	return len(px.Networks)
 }
 
-// String returns a human-readable representation (without credentials).
+// String returns a human-readable representation.
 func (px *Proxy) String() string {
 	status := "healthy"
 	if !px.Healthy {
 		status = "unhealthy"
 	}
-	return fmt.Sprintf("socks5://%s:%s (%s, used %d times, %d networks)",
-		px.Host, px.Port, status, px.UseCount, len(px.Networks))
+	extra := ""
+	if px.Country != "" {
+		extra = " " + px.Country
+	}
+	return fmt.Sprintf("socks5://%s:%s (%s, used %d times, %d networks%s)",
+		px.Host, px.Port, status, px.UseCount, len(px.Networks), extra)
 }
 
-// StartHealthChecker runs a background goroutine that periodically tests
-// unhealthy proxies and marks them healthy again if they recover.
-func (p *Pool) StartHealthChecker(ctx context.Context) {
-	ticker := time.NewTicker(DefaultHealthCheckInterval)
-	defer ticker.Stop()
-
-	p.log.Info("proxy health checker started", "interval", DefaultHealthCheckInterval)
-
-	for {
-		select {
-		case <-ctx.Done():
-			p.log.Info("proxy health checker stopped")
-			return
-		case <-ticker.C:
-			p.checkUnhealthyProxies(ctx)
-		}
-	}
-}
-
-// checkUnhealthyProxies tests all unhealthy proxies and marks recovered ones healthy.
-func (p *Pool) checkUnhealthyProxies(ctx context.Context) {
-	p.mu.RLock()
-	var unhealthy []*Proxy
-	for _, px := range p.proxies {
-		if !px.Healthy && time.Since(px.LastFail) >= DefaultRecoveryDelay {
-			unhealthy = append(unhealthy, px)
-		}
-	}
-	p.mu.RUnlock()
-
-	if len(unhealthy) == 0 {
-		return
-	}
-
-	p.log.Debug("checking unhealthy proxies", "count", len(unhealthy))
-
-	for _, px := range unhealthy {
-		if ctx.Err() != nil {
-			return
-		}
-		if p.testProxy(px) {
-			p.MarkHealthy(px)
-			p.log.Info("proxy recovered", "proxy", px.Host+":"+px.Port)
-		}
-	}
-}
-
-// testProxy checks if a proxy is reachable by establishing a SOCKS5 connection.
-func (p *Pool) testProxy(px *Proxy) bool {
-	var auth *proxy.Auth
-	if px.Username != "" {
-		auth = &proxy.Auth{
-			User:     px.Username,
-			Password: px.Password,
-		}
-	}
-
-	dialer, err := proxy.SOCKS5("tcp", px.ProxyAddress(), auth, &net.Dialer{
+// TestConnectivity checks if a proxy is reachable by establishing a SOCKS5 connection.
+func (p *Pool) TestConnectivity(px *Proxy) bool {
+	dialer, err := netproxy.SOCKS5("tcp", px.ProxyAddress(), nil, &net.Dialer{
 		Timeout: DefaultHealthCheckTimeout,
 	})
 	if err != nil {
-		p.log.Debug("proxy health check failed (dialer)", "proxy", px.ProxyAddress(), "error", err)
+		p.log.Debug("proxy connectivity check failed (dialer)", "proxy", px.ProxyAddress(), "error", err)
 		return false
 	}
 
-	// Try to establish a connection through the proxy to a well-known address
 	conn, err := dialer.Dial("tcp", "irc.efnet.org:6667")
 	if err != nil {
-		p.log.Debug("proxy health check failed (dial)", "proxy", px.ProxyAddress(), "error", err)
+		p.log.Debug("proxy connectivity check failed (dial)", "proxy", px.ProxyAddress(), "error", err)
 		return false
 	}
 	conn.Close()
 	return true
-}
-
-// parseProxy parses a proxy URL string into a Proxy struct.
-func parseProxy(raw string) (*Proxy, error) {
-	// Ensure it has a scheme
-	if !strings.Contains(raw, "://") {
-		raw = "socks5://" + raw
-	}
-
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parsing proxy URL %q: %w", raw, err)
-	}
-
-	if u.Scheme != "socks5" && u.Scheme != "socks" {
-		return nil, fmt.Errorf("unsupported proxy scheme %q (only socks5 supported)", u.Scheme)
-	}
-
-	host := u.Hostname()
-	port := u.Port()
-	if port == "" {
-		port = "1080" // default SOCKS5 port
-	}
-
-	proxy := &Proxy{
-		URL:      raw,
-		Host:     host,
-		Port:     port,
-		Healthy:  true,
-		Networks: make(map[string]bool),
-	}
-
-	if u.User != nil {
-		proxy.Username = u.User.Username()
-		proxy.Password, _ = u.User.Password()
-	}
-
-	return proxy, nil
 }

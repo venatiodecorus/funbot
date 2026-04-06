@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,9 +15,21 @@ import (
 	"github.com/venatiodecorus/funbot/internal/config"
 )
 
+// Set via ldflags at build time.
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	configPath := flag.String("config", "", "Path to config file")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("funbot %s (commit %s)\n", version, commit)
+		os.Exit(0)
+	}
 
 	// Load configuration
 	cfg, err := config.Load(*configPath)
@@ -45,7 +58,7 @@ func main() {
 	log := slog.New(handler)
 	slog.SetDefault(log)
 
-	log.Info("starting funbot")
+	log.Info("starting funbot", "version", version, "commit", commit)
 
 	// Set up context with signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())

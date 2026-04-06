@@ -1,108 +1,187 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
-func TestParseProxy(t *testing.T) {
-	tests := []struct {
-		input    string
-		wantHost string
-		wantPort string
-		wantUser string
-		wantErr  bool
-	}{
-		{"socks5://1.2.3.4:1080", "1.2.3.4", "1080", "", false},
-		{"socks5://user:pass@1.2.3.4:1080", "1.2.3.4", "1080", "user", false},
-		{"1.2.3.4:1080", "1.2.3.4", "1080", "", false},
-		{"socks5://host.example.com:9050", "host.example.com", "9050", "", false},
-		{"socks5://1.2.3.4", "1.2.3.4", "1080", "", false}, // default port
-		{"http://1.2.3.4:8080", "", "", "", true},          // wrong scheme
-	}
+// newTestPool creates a pool with some proxies pre-loaded for testing.
+func newTestPool(t *testing.T, proxies ...*Proxy) *Pool {
+	t.Helper()
+	pool := NewPool(slog.Default())
+	pool.proxies = proxies
+	return pool
+}
 
-	for _, tt := range tests {
-		px, err := parseProxy(tt.input)
-		if tt.wantErr {
-			if err == nil {
-				t.Errorf("parseProxy(%q) expected error", tt.input)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseProxy(%q) unexpected error: %v", tt.input, err)
-			continue
-		}
-		if px.Host != tt.wantHost {
-			t.Errorf("parseProxy(%q) host = %q, want %q", tt.input, px.Host, tt.wantHost)
-		}
-		if px.Port != tt.wantPort {
-			t.Errorf("parseProxy(%q) port = %q, want %q", tt.input, px.Port, tt.wantPort)
-		}
-		if px.Username != tt.wantUser {
-			t.Errorf("parseProxy(%q) user = %q, want %q", tt.input, px.Username, tt.wantUser)
-		}
-		if !px.Healthy {
-			t.Errorf("parseProxy(%q) should be healthy by default", tt.input)
-		}
-		if px.Networks == nil {
-			t.Errorf("parseProxy(%q) Networks map should be initialized", tt.input)
-		}
+func makeProxy(host, port string) *Proxy {
+	return &Proxy{
+		Host:     host,
+		Port:     port,
+		Healthy:  true,
+		Networks: make(map[string]bool),
 	}
 }
 
-func TestPoolLoadFromFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "proxies.txt")
+func TestFetchFromAPI(t *testing.T) {
+	resp := apiResponse{
+		Proxies: []apiProxy{
+			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true, Country: "US"},
+			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true, Country: "DE"},
+			{IP: "9.9.9.9", Port: 1080, Protocol: "socks5", Alive: false, Country: "FR"}, // dead
+		},
+		Total: 3,
+	}
 
-	content := `# Comment line
-socks5://1.2.3.4:1080
-socks5://user:pass@5.6.7.8:9050
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/proxies" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
 
-socks5://invalid-no-scheme
-socks5://9.10.11.12:1080
-`
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "socks5", 0)
+
+	err := pool.FetchFromAPI(context.Background())
+	if err != nil {
+		t.Fatalf("FetchFromAPI error: %v", err)
+	}
+
+	// Should have 2 alive proxies (dead one filtered)
+	if pool.Count() != 2 {
+		t.Errorf("expected 2 proxies, got %d", pool.Count())
+	}
+	if pool.HealthyCount() != 2 {
+		t.Errorf("expected 2 healthy, got %d", pool.HealthyCount())
+	}
+}
+
+func TestFetchFromAPI_QueryParams(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(apiResponse{})
+	}))
+	defer srv.Close()
+
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "socks5", 500)
+	pool.FetchFromAPI(context.Background())
+
+	if gotQuery == "" {
+		t.Fatal("expected query parameters")
+	}
+	// Check that protocol and max_latency are passed
+	if got := gotQuery; got == "" {
+		t.Fatal("empty query")
+	}
+	// Just verify the key params are present
+	if !contains(gotQuery, "protocol=socks5") {
+		t.Errorf("expected protocol=socks5 in query, got %q", gotQuery)
+	}
+	if !contains(gotQuery, "max_latency=500") {
+		t.Errorf("expected max_latency=500 in query, got %q", gotQuery)
+	}
+	if !contains(gotQuery, "limit=1000") {
+		t.Errorf("expected limit=1000 in query, got %q", gotQuery)
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsAt(s, substr))
+}
+
+func containsAt(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFetchFromAPI_PreservesInUse(t *testing.T) {
+	// Start with an in-use proxy
+	existing := makeProxy("1.2.3.4", "1080")
+	existing.Networks["efnet"] = true
+	existing.UseCount = 5
+
+	pool := newTestPool(t, existing)
+
+	// API returns same proxy plus a new one
+	resp := apiResponse{
+		Proxies: []apiProxy{
+			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true},
+			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
+		},
+		Total: 2,
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	pool.SetAPI(srv.URL, "", 0)
+	if err := pool.FetchFromAPI(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-
-	pool := NewPool(slog.Default())
-	if err := pool.LoadFromFile(path); err != nil {
-		t.Fatalf("LoadFromFile error: %v", err)
-	}
-
-	// Should have loaded 4 valid proxies (the bare one gets socks5:// prepended)
-	if pool.Count() != 4 {
-		t.Errorf("expected 4 proxies, got %d", pool.Count())
-	}
-	if pool.HealthyCount() != 4 {
-		t.Errorf("expected 4 healthy, got %d", pool.HealthyCount())
-	}
-}
-
-func TestPoolLoadFromList(t *testing.T) {
-	pool := NewPool(slog.Default())
-	list := []string{
-		"socks5://1.2.3.4:1080",
-		"socks5://5.6.7.8:1080",
-	}
-	if err := pool.LoadFromList(list); err != nil {
-		t.Fatalf("LoadFromList error: %v", err)
 	}
 
 	if pool.Count() != 2 {
 		t.Errorf("expected 2 proxies, got %d", pool.Count())
 	}
+
+	// Verify the in-use proxy was preserved with its state
+	found := false
+	for _, px := range pool.All() {
+		if px.Host == "1.2.3.4" && px.Networks["efnet"] {
+			found = true
+			if px.UseCount != 5 {
+				t.Errorf("expected preserved use count 5, got %d", px.UseCount)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected preserved in-use proxy with efnet assignment")
+	}
+}
+
+func TestFetchFromAPI_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("internal error"))
+	}))
+	defer srv.Close()
+
+	pool := NewPool(slog.Default())
+	pool.SetAPI(srv.URL, "", 0)
+
+	err := pool.FetchFromAPI(context.Background())
+	if err == nil {
+		t.Fatal("expected error for 500 response")
+	}
+}
+
+func TestFetchFromAPI_NoURL(t *testing.T) {
+	pool := NewPool(slog.Default())
+	err := pool.FetchFromAPI(context.Background())
+	if err == nil {
+		t.Fatal("expected error when no API URL configured")
+	}
 }
 
 func TestPoolAcquireForNetwork(t *testing.T) {
-	pool := NewPool(slog.Default())
-	_ = pool.LoadFromList([]string{
-		"socks5://1.2.3.4:1080",
-		"socks5://5.6.7.8:1080",
-	})
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+	)
 
 	p1 := pool.AcquireForNetwork("efnet")
 	if p1 == nil {
@@ -123,6 +202,7 @@ func TestPoolAcquireForNetwork(t *testing.T) {
 		t.Error("expected different proxy on second acquire for same network")
 	}
 
+	// Same proxy can serve a different network
 	p3 := pool.AcquireForNetwork("undernet")
 	if p3 == nil {
 		t.Fatal("expected a proxy for different network")
@@ -131,6 +211,7 @@ func TestPoolAcquireForNetwork(t *testing.T) {
 		t.Error("expected proxy to be marked for undernet")
 	}
 
+	// All proxies used for efnet
 	p4 := pool.AcquireForNetwork("efnet")
 	if p4 != nil {
 		t.Error("expected nil when all proxies are used for network")
@@ -138,11 +219,10 @@ func TestPoolAcquireForNetwork(t *testing.T) {
 }
 
 func TestPoolReleaseFromNetwork(t *testing.T) {
-	pool := NewPool(slog.Default())
-	_ = pool.LoadFromList([]string{
-		"socks5://1.2.3.4:1080",
-		"socks5://5.6.7.8:1080",
-	})
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+	)
 
 	p1 := pool.AcquireForNetwork("efnet")
 	if p1 == nil {
@@ -163,12 +243,11 @@ func TestPoolReleaseFromNetwork(t *testing.T) {
 }
 
 func TestPoolAvailableForNetwork(t *testing.T) {
-	pool := NewPool(slog.Default())
-	_ = pool.LoadFromList([]string{
-		"socks5://1.2.3.4:1080",
-		"socks5://5.6.7.8:1080",
-		"socks5://9.10.11.12:1080",
-	})
+	pool := newTestPool(t,
+		makeProxy("1.2.3.4", "1080"),
+		makeProxy("5.6.7.8", "1080"),
+		makeProxy("9.10.11.12", "1080"),
+	)
 
 	if pool.AvailableForNetwork("efnet") != 3 {
 		t.Errorf("expected 3 available for efnet, got %d", pool.AvailableForNetwork("efnet"))
@@ -207,61 +286,17 @@ func TestProxyString(t *testing.T) {
 		Healthy:  true,
 		UseCount: 3,
 		Networks: map[string]bool{"efnet": true},
+		Country:  "US",
 	}
 	s := px.String()
-	expected := "socks5://1.2.3.4:1080 (healthy, used 3 times, 1 networks)"
+	expected := "socks5://1.2.3.4:1080 (healthy, used 3 times, 1 networks US)"
 	if s != expected {
 		t.Errorf("unexpected string: %q, want %q", s, expected)
 	}
 }
 
-func TestProxyHasAuth(t *testing.T) {
-	px1 := &Proxy{Username: "user", Password: "pass"}
-	if !px1.HasAuth() {
-		t.Error("expected HasAuth to be true")
-	}
-
-	px2 := &Proxy{}
-	if px2.HasAuth() {
-		t.Error("expected HasAuth to be false")
-	}
-}
-
-func TestPoolReload(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "proxies.txt")
-
-	if err := os.WriteFile(path, []byte("socks5://1.2.3.4:1080\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	pool := NewPool(slog.Default())
-	if err := pool.LoadFromFile(path); err != nil {
-		t.Fatal(err)
-	}
-	if pool.Count() != 1 {
-		t.Fatalf("expected 1 proxy, got %d", pool.Count())
-	}
-
-	if err := os.WriteFile(path, []byte("socks5://1.2.3.4:1080\nsocks5://5.6.7.8:1080\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := pool.Reload(); err != nil {
-		t.Fatal(err)
-	}
-	if pool.Count() != 2 {
-		t.Errorf("expected 2 proxies after reload, got %d", pool.Count())
-	}
-}
-
 func TestProxyNetworkCount(t *testing.T) {
-	px := &Proxy{
-		Host:     "1.2.3.4",
-		Port:     "1080",
-		Healthy:  true,
-		Networks: make(map[string]bool),
-	}
+	px := makeProxy("1.2.3.4", "1080")
 
 	if px.NetworkCount() != 0 {
 		t.Errorf("expected 0 networks, got %d", px.NetworkCount())

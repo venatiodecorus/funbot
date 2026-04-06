@@ -16,7 +16,10 @@ networks:
     flood_delay_ms: 500
 
 proxies:
-  file: ""
+  api_url: "http://localhost:8080"
+  protocol: "socks5"
+  max_latency: 1000
+  refresh_interval: "5m"
 
 art:
   repo_url: "https://github.com/birdneststream/asciiart.git"

@@ -129,8 +129,6 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 			Logger:     nm.log,
 			FloodDelay: nm.netCfg.FloodDelay(),
 			ProxyAddr:  px.ProxyAddress(),
-			ProxyUser:  px.Username,
-			ProxyPass:  px.Password,
 		}
 
 		client := irc.New(cfg)
