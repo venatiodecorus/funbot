@@ -167,7 +167,7 @@ func TestCatalog_ListCategories(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	cats := cat.ListCategories()
 
@@ -185,7 +185,7 @@ func TestCatalog_ListByCategory(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	entries := cat.ListByCategory("animals")
 	if len(entries) != 2 {
@@ -207,7 +207,7 @@ func TestCatalog_SkipsHiddenDirs(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	// .git/config should not be indexed
 	results := cat.Search("config")
@@ -220,7 +220,7 @@ func TestCatalog_SkipsNonArtFiles(t *testing.T) {
 	dir := setupTestDir(t)
 	log := slog.Default()
 	cat := NewCatalog(dir, log)
-	cat.Refresh()
+	_ = cat.Refresh()
 
 	// readme.md and image.png should not be indexed
 	results := cat.Search("readme")
