@@ -1,9 +1,24 @@
+# Deployment docker-compose for funbot.
+#
+# Usage:
+#   1. Copy this file and your funbot.yaml to a directory:
+#        mkdir funbot && cd funbot
+#        cp /path/to/docker-compose.yaml .
+#        cp /path/to/funbot.yaml .
+#
+#   2. Edit funbot.yaml with your settings.
+#
+#   3. Run:
+#        docker compose up -d
+#
+# The config file is expected at ./funbot.yaml relative to this file.
+
 services:
   funbot:
     image: ghcr.io/venatiodecorus/funbot:latest
     restart: unless-stopped
     volumes:
-      - ./config:/etc/funbot:ro
+      - ./funbot.yaml:/etc/funbot/funbot.yaml:ro
       - art-data:/data/asciiart
 
 volumes:

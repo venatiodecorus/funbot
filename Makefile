@@ -51,8 +51,5 @@ docker-up:
 docker-down:
 	docker compose -f deploy/docker-compose.yaml down
 
-docker-pull:
-	docker compose -f deploy/docker-compose.yaml pull
-
 deps:
 	go mod tidy
