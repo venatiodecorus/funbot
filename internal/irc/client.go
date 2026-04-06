@@ -334,7 +334,24 @@ func (c *Client) createProxyDialer() (proxy.Dialer, error) {
 // ProxyAddr returns the SOCKS5 proxy address used for this connection,
 // or an empty string if using a direct connection.
 func (c *Client) ProxyAddr() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.proxyAddr
+}
+
+// SetProxy updates the SOCKS5 proxy address (and optional credentials) used
+// for future connection attempts. This should be called between retry cycles
+// when rotating to a new proxy.
+func (c *Client) SetProxy(addr, user, pass string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.proxyAddr = addr
+	c.proxyUser = user
+	c.proxyPass = pass
+	c.cfg.ProxyAddr = addr
+	c.cfg.ProxyUser = user
+	c.cfg.ProxyPass = pass
+	c.log.Info("proxy updated", "proxy", addr)
 }
 
 // Quit sends an IRC QUIT command with the given reason, then closes the

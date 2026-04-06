@@ -156,23 +156,68 @@ func (nm *NetworkManager) AddClients(count int) (int, error) {
 		nm.clients = append(nm.clients, client)
 		nm.mu.Unlock()
 
-		go func(c *irc.Client, id string, proxyAddr string) {
-			nm.log.Info("connecting client via proxy", "client_id", id, "proxy", proxyAddr)
-			if err := c.ConnectWithRetry(nm.ctx, 0); err != nil {
-				if nm.ctx.Err() != nil {
-					return
-				}
-				nm.log.Error("client connection failed permanently",
-					"client_id", id, "error", err)
-				// Mark the proxy as failed
-				nm.proxyPool.ReleaseByAddressFromNetwork(proxyAddr, nm.network, true)
-			}
-		}(client, clientID, px.ProxyAddress())
+		go nm.runClientWithProxyRotation(client, clientID, px.ProxyAddress())
 
 		added++
 	}
 
 	return added, nil
+}
+
+// runClientWithProxyRotation manages a client's connection lifecycle with
+// proxy rotation. It connects via ConnectWithRetry using the pool's
+// maxRetries as the per-proxy attempt limit. When retries are exhausted
+// the current proxy is released as failed and a new one is acquired. This
+// continues until the context is cancelled or no proxies are available.
+func (nm *NetworkManager) runClientWithProxyRotation(client *irc.Client, clientID, proxyAddr string) {
+	maxRetries := nm.proxyPool.MaxRetries()
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+
+	currentProxy := proxyAddr
+
+	for {
+		if nm.ctx.Err() != nil {
+			return
+		}
+
+		nm.log.Info("connecting client via proxy",
+			"client_id", clientID, "proxy", currentProxy)
+
+		err := client.ConnectWithRetry(nm.ctx, maxRetries)
+		if nm.ctx.Err() != nil {
+			return
+		}
+
+		// Retries exhausted for this proxy — release it as failed
+		nm.log.Warn("proxy retries exhausted, rotating proxy",
+			"client_id", clientID,
+			"proxy", currentProxy,
+			"max_retries", maxRetries,
+			"error", err,
+		)
+		nm.proxyPool.ReleaseByAddressFromNetwork(currentProxy, nm.network, true)
+
+		// Try to get a new proxy (with on-demand fetch)
+		ctx := nm.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		nm.proxyPool.EnsureAvailable(ctx, nm.network, 1)
+
+		newPx := nm.proxyPool.AcquireForNetwork(nm.network)
+		if newPx == nil {
+			nm.log.Error("no proxies available for rotation, client giving up",
+				"client_id", clientID, "network", nm.network)
+			return
+		}
+
+		currentProxy = newPx.ProxyAddress()
+		client.SetProxy(currentProxy, "", "")
+		nm.log.Info("rotated to new proxy",
+			"client_id", clientID, "proxy", currentProxy)
+	}
 }
 
 // RemoveClients disconnects and removes clients from this network.

@@ -113,6 +113,15 @@ func (p *Pool) SetMinPoolSize(minPoolSize int) {
 	p.minPoolSize = minPoolSize
 }
 
+// MaxRetries returns the configured maximum consecutive failures before a
+// proxy is purged. This is useful for callers that need to limit per-proxy
+// connection attempts to match the pool's purge threshold.
+func (p *Pool) MaxRetries() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.maxRetries
+}
+
 // FetchFromAPI fetches proxies from the proxy-scanner API and replaces the
 // pool contents. Proxies that are currently in use (assigned to a network)
 // are preserved and merged with the fresh list.
