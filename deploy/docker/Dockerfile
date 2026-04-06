@@ -13,7 +13,9 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /funbot ./cmd/funbot
 
-FROM gcr.io/distroless/static-debian12
+FROM alpine:3.21
+
+RUN apk add --no-cache git ca-certificates
 
 LABEL org.opencontainers.image.source="https://github.com/venatiodecorus/funbot"
 LABEL org.opencontainers.image.description="IRC bot with proxy-backed multi-client connections"

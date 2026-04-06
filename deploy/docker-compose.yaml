@@ -7,16 +7,17 @@
 #        cp /path/to/funbot.yaml .
 #
 #   2. Edit funbot.yaml with your settings.
+#      Set proxies.api_url to "http://localhost:8080" (network_mode: host
+#      makes the container share the host's network stack).
 #
 #   3. Run:
 #        docker compose up -d
-#
-# The config file is expected at ./funbot.yaml relative to this file.
 
 services:
   funbot:
     image: ghcr.io/venatiodecorus/funbot:latest
     restart: unless-stopped
+    network_mode: host
     volumes:
       - ./funbot.yaml:/etc/funbot/funbot.yaml:ro
       - art-data:/data/asciiart
