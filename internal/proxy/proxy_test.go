@@ -33,7 +33,7 @@ func TestFetchFromAPI(t *testing.T) {
 			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true, Country: "DE"},
 			{IP: "9.9.9.9", Port: 1080, Protocol: "socks5", Alive: false, Country: "FR"}, // dead
 		},
-		Total: 3,
+		Count: 3,
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +121,7 @@ func TestFetchFromAPI_PreservesInUse(t *testing.T) {
 			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true},
 			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
 		},
-		Total: 2,
+		Count: 2,
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -409,7 +409,7 @@ func TestEnsureAvailable(t *testing.T) {
 			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
 			{IP: "9.10.11.12", Port: 1080, Protocol: "socks5", Alive: true},
 		},
-		Total: 3,
+		Count: 3,
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,7 +469,7 @@ func TestRefillIfNeeded(t *testing.T) {
 			{IP: "1.2.3.4", Port: 1080, Protocol: "socks5", Alive: true},
 			{IP: "5.6.7.8", Port: 1080, Protocol: "socks5", Alive: true},
 		},
-		Total: 2,
+		Count: 2,
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

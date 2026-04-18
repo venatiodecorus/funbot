@@ -45,20 +45,23 @@ const (
 
 // apiProxy is the JSON structure returned by the proxy-scanner API.
 type apiProxy struct {
-	ID        int     `json:"id"`
-	IP        string  `json:"ip"`
-	Port      int     `json:"port"`
-	Protocol  string  `json:"protocol"`
-	Anonymity string  `json:"anonymity"`
-	Country   string  `json:"country"`
-	LatencyMs float64 `json:"latency_ms"`
-	Alive     bool    `json:"alive"`
+	ID        int    `json:"id"`
+	IP        string `json:"ip"`
+	Port      int    `json:"port"`
+	Protocol  string `json:"protocol"`
+	Anonymity string `json:"anonymity"`
+	Country   string `json:"country"`
+	City      string `json:"city"`
+	ASN       int    `json:"asn"`
+	ASNOrg    string `json:"asn_org"`
+	LatencyMs int    `json:"latency_ms"`
+	Alive     bool   `json:"alive"`
 }
 
 // apiResponse is the JSON wrapper returned by the proxy-scanner /v1/proxies endpoint.
 type apiResponse struct {
 	Proxies []apiProxy `json:"proxies"`
-	Total   int        `json:"total"`
+	Count   int        `json:"count"`
 }
 
 // Proxy represents a single SOCKS5 proxy.
